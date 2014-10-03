@@ -8,6 +8,20 @@ import scala.reflect.interpreter._
 /** Annotation for carrying the body of the macro annotation. */
 final class body[T](body: T) extends StaticAnnotation
 
+object MacroUID {
+  def impl(c: Context)(base: c.Expr[Long], exp: c.Expr[Long]): c.Expr[Long] = {
+    // TODO: check if the input parameter is static and abort if not
+    import c.universe._
+    val bodyAnnotation =
+      c.macroApplication.symbol.annotations.filter(_.tree.tpe <:< c.typeOf[body[_]]).head
+    val body = bodyAnnotation.scalaArgs.head
+    // replace all the arguments in the body with base and exp
+    val Block(List(DefDef(_, _, _, _, _, f)), _) = body
+    println(showCode(f))
+    c.Expr[Long](f)
+  }
+}
+
 object InlineMacros {
   // Just takes the body of the valdef from the annotation.
   def valImpl[T](c: Context): c.Expr[T] = {
@@ -17,6 +31,15 @@ object InlineMacros {
     val body = bodyAnnotation.scalaArgs.head
     c.Expr[T](body)
   }
+
+  // For now no type parameters
+  //  def defImpl(c: Context): c.Expr[T] = {
+  //    import c.universe._
+  //    val bodyAnnotation =
+  //      c.macroApplication.symbol.annotations.filter(_.tree.tpe <:< c.typeOf[body[_]]).head
+  //    val Function(_, body) = bodyAnnotation.scalaArgs.head
+  //    c.Expr[T](body)
+  //  }
 
   def sinline[T](c: Context)(body: c.Expr[T]): c.Expr[T] = {
     import c.universe._
@@ -59,7 +82,24 @@ private object InlineMacroAnnotation {
           @body[${vd.tpt}](${vd.rhs})
           def x: ${vd.tpt} = macro ch.epfl.inline.InlineMacros.valImpl[${vd.tpt}]
         """)
-      case _ => inputs
+      case (vd: ValDef) :: (body: DefDef) :: Nil =>
+        /* HUMONGUOUS HACK ALERT!
+         * Since macros must be separately compiled and must match the signature 
+         * of the method we just:
+         * 1) generate trees for our macro
+         * 2) generate code out of these trees
+         * 3) compile this code with a separate ScalaCompiler
+         * 4) load the output .class files
+         * 5) use them in our method result
+         * As easy as 1-2-3-4-5.
+        */
+
+        List(q"""
+          @body[Unit]({$body})
+          def pow(base: Long, exp: Long): Long = macro ch.epfl.inline.MacroUID.impl
+        """)
+      case _ =>
+        inputs
     }
 
     c.Expr[Any](Block(outputs, Literal(Constant(()))))
