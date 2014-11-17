@@ -14,7 +14,7 @@ object ScalaInlineBuild extends Build {
   lazy val projectSettings = Seq[Setting[_]](
     version              := "0.1.0-SNAPSHOT",
     organization         := "ch.epfl.lamp",
-    licenses             := Seq("New BSD" -> 
+    licenses             := Seq("New BSD" ->
       url("https://raw.githubusercontent.com/scala-inline/scala-inline/master/LICENCE")),
     homepage             := Some(url("https://github.com/scala-inline/scala-inline")),
     organizationHomepage := Some(url("http://lamp.epfl.ch")),
@@ -40,33 +40,31 @@ object ScalaInlineBuild extends Build {
       "junit" % "junit" % "4.11" % "test" // we need JUnit explicitly
   )))
 
-  // modules  
+  // modules
   lazy val scalaInline  = Project(id = "scala-inline", base = file(".") , settings = defaults ++ paradise ++ Seq(name := "scala-inline"))
 
   lazy val defaults = projectSettings ++ scalaSettings ++ formatSettings ++ libraryDeps ++ Seq(
     resolvers +=  "OSSH" at "https://oss.sonatype.org/content/groups/public",
     resolvers += Resolver.sonatypeRepo("snapshots"),
     resolvers += "Sonatype OSS Snapshots" at "https://oss.sonatype.org/content/repositories/snapshots",
-    testFrameworks += new TestFramework("org.scalameter.ScalaMeterFramework"),
-    // paths - so we don't need to have src/main/scala ... just src/ test/ and resources/
     scalaSource in Compile <<= baseDirectory(_ / "src"),
     scalaSource in Test <<= baseDirectory(_ / "test"),
     resourceDirectory in Compile <<= baseDirectory(_ / "resources"),
     // sbteclipse needs some info on source directories:
     unmanagedSourceDirectories in Compile <<= (scalaSource in Compile)(Seq(_)),
     unmanagedSourceDirectories in Test <<= (scalaSource in Test)(Seq(_)),
-    parallelExecution in Test := false,
-    incOptions := incOptions.value.withNameHashing(true)
+    parallelExecution in Test := false
   )
 
   // add the macro paradise compiler plugin
   lazy val paradise = Seq(
     libraryDependencies += {
-      val paradiseVersion =  
+      val paradiseVersion =
         if (scalaVersion.value == "2.11.2") "2.0.1"
         else "2.0.0"
       compilerPlugin("org.scalamacros" % "paradise" %  paradiseVersion cross CrossVersion.full)
     },
+    libraryDependencies += "org.scalamacros" %% "resetallattrs" % "1.0.0-SNAPSHOT",
     libraryDependencies += "org.scalareflect" %% "interpreter" % "0.1.0-SNAPSHOT",
     scalacOptions := defaultScalacOptions
   )
@@ -114,7 +112,7 @@ object ScalaInlineBuild extends Build {
           <id>denish</id>
           <name>Denys Shabalin</name>
           <url>http://den.sh/</url>
-        </developer>        
+        </developer>
       </developers>
     )
   )

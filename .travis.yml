@@ -1,7 +1,11 @@
 language: scala
 before-script:
   - git clone https://github.com/scalareflect/interpreter.git
+  - git clone https://github.com/scalamacros/resetallattrs.git
   - cd interpreter
+  - sbt publish-local
+  - cd ..
+  - cd resetallattrs
   - sbt publish-local
 script:
   - sbt ++$TRAVIS_SCALA_VERSION clean update compile test package

@@ -13,6 +13,8 @@ package object inline {
 
   def sinline[T](body: T): T = macro InlineMacros.sinline[T]
 
+  def sinline$placeholder[T](body: => T): T = body
+
   // Well reify does not work :/
   def treeString[T](body: T): String = macro InlineMacros.treeString[T]
 }
