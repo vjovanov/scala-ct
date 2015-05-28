@@ -82,43 +82,72 @@ class Tuple2[+T, +U](val _1: T, val _2: U) {
 
 import ch.epfl.scalact._
 
+@ctv
 object Numeric {
-  @ct implicit def dnum(): Numeric[Double] @ct = DoubleNumeric
-  @ct implicit def dnumct(): Numeric[Double @ct] @ct = DoubleNumericCT
+  @ctv implicit def dnum(): Numeric[Double @ctv?] @ct = DoubleNumeric
 }
 
 trait Numeric[T] {
-  def plus(x: T, y: T): T
-  def minus(x: T, y: T): T
-  def times(x: T, y: T): T
-  def fromInt(x: Int): T
+  @ctv def plus(x: T, y: T): T
+  @ctv def minus(x: T, y: T): T
+  @ctv def times(x: T, y: T): T
+  @ctv def fromInt(x: Int): T
 
-  def zero(): T
-  def one(): T
+  @ctv def zero(): T
+  @ctv def one(): T
 
+  @ct
   class Ops(lhs: T) {
-    @ct def +(rhs: T) = plus(lhs, rhs)
-    @ct def -(rhs: T) = minus(lhs, rhs)
-    @ct def *(rhs: T) = times(lhs, rhs)
+    @ctv def +(rhs: T) = plus(lhs, rhs)
+    @ctv def -(rhs: T) = minus(lhs, rhs)
+    @ctv def *(rhs: T) = times(lhs, rhs)
   }
 
-  @ct implicit def mkNumericOps(lhs: T): Ops = new (Ops @ ct)(lhs)
+  @ctv implicit def mkNumericOps(lhs: T): Ops = new Ops(lhs)
 }
 
-object DoubleNumeric extends Numeric[Double] @ct {
-  @ct def plus(x: Double, y: Double): Double = x + y
-  @ct def minus(x: Double, y: Double): Double = x - y
-  @ct def times(x: Double, y: Double): Double = x * y
-  @ct def fromInt(x: Int): Double = x
-  @ct def one: Double = 1.0
-  @ct def zero: Double = 0.0
+object DoubleNumeric extends Numeric[Double] {
+  @ctv def plus(x: Double @ctv?, y: Double @ctv?): Double @ctv? = x + y
+  @ctv def minus(x: Double @ctv?, y: Double @ctv?): Double @ctv? = x - y
+  @ctv def times(x: Double @ctv?, y: Double @ctv?): Double @ctv? = x * y
+  @ctv def fromInt(x: Int @ctv?): Double = x
+  @ctv def one: Double = 1.0
+  @ctv def zero: Double = 0.0
 }
 
-object DoubleNumericCT extends Numeric[Double @ct] @ct {
-  @ct def plus(x: Double @ct, y: Double @ct): Double @ct = x + y
-  @ct def minus(x: Double @ct, y: Double @ct): Double @ct = x - y
-  @ct def times(x: Double @ct, y: Double @ct): Double @ct = x * y
-  @ct def fromInt(x: Int @ct): Double = x
-  @ct def one: Double @ct = ct(1.0)
-  @ct def zero: Double @ct = ct(0.0)
+// Full blown solution
+@ct object Numeric {
+  @ctv implicit def dnum[T <: Double](): Numeric[T] @ctv =
+    ct[T](DoubleNumeric)
 }
+
+ trait Numeric[T] {
+   def plus(x: T, y: T): T
+   def minus(x: T, y: T): T
+   def times(x: T, y: T): T
+   def fromInt(x: Int): T
+
+   def zero(): T
+   def one(): T
+
+   class Ops(lhs: T) {
+    def +(rhs: T) = plus(lhs, rhs)
+    def -(rhs: T) = minus(lhs, rhs)
+    def *(rhs: T) = times(lhs, rhs)
+  }
+
+  @ctv implicit def mkNumericOps(lhs: T): Ops = new (Ops@ctv)(lhs)
+}
+
+@ct? object DoubleNumeric extends Numeric[Double@ct?]@ctv {
+  @ctv def plus(x: Double @ct?, y: Double @ct?): Double@ct? = x + y
+  @ctv def minus(x: Double @ct?, y: Double @ct?): Double@ct? = x - y
+  @ctv def times(x: Double @ct?, y: Double @ct?): Double@ct? = x * y
+  @ctv def fromInt(x: Int @ct?): Double @ct? = x
+  @ctv def one: Double@ct? = ct?(1.0)
+  @ctv def zero: Double@ct? = ct?(0.0)
+}
+
+// What happens to narrowed polymorphic types? @ct? should solve this.
+// Soundness of the whole approach? Read the papers?
+// Implementation: work on it until 1st June.
