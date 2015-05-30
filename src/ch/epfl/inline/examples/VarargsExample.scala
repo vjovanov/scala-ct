@@ -1,4 +1,5 @@
 package ch.epfl.scalact.examples
+import scala.language.experimental.macros
 import reflect.macros.blackbox.Context
 import ch.epfl.scalact.ct
 // Translation for vararg methods

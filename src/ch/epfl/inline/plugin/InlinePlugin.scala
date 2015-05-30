@@ -3,13 +3,10 @@ package ch.epfl.scalact.plugin
 import scala.reflect.macros.blackbox.Context
 import scala.tools.nsc
 import nsc.Global
-import nsc.Phase
 import nsc.transform.{ Transform, TypingTransformers }
 import nsc.plugins.Plugin
 import nsc.plugins.PluginComponent
-import scala.annotation.StaticAnnotation
 import scala.collection.mutable
-import java.io._
 import scala.reflect.interpreter._
 
 class PartialEvaluationPlugin(val global: Global) extends Plugin {
@@ -95,11 +92,11 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin {
   case object SelectContext extends DebugContext
   case object News extends DebugContext
   case object Blocks extends DebugContext
-  case object Minimization extends DebugContext
+  case object Inlining extends DebugContext
 
   var ident = 0
   var debugging = false
-  val debugContexts: Set[DebugContext] = Set(ValDefs, Interpreter)
+  val debugContexts: Set[DebugContext] = Set()
   def debug(msg: String, context: DebugContext = Default): Unit =
     if (debugContexts.contains(context) && debugging) println("" * ident + msg)
 
@@ -155,9 +152,10 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin {
 
       def inlineTransformed[C <: Context](c: C)(body: c.Tree)(
         tr: (c.Tree, c.internal.TypingTransformApi) => c.Tree)(
-          tparamsMap: Map[c.Symbol, c.Type])(paramss: List[List[c.Tree]], args: List[c.Tree]): c.Tree = {
+          tparamsMap: Map[c.Symbol, c.Symbol])(paramss: List[List[c.Tree]], args: List[c.Tree]): c.Tree = {
         import c.universe._
         import c.universe.internal._, decorators._
+
         val params = paramss.flatten
         val paramsMap = (params zip args).map {
           case (param @ q"${ _ } val $name: ${ _ } = ${ _ }", arg) =>
@@ -170,27 +168,36 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin {
             (param.symbol, (tempSym, valDef))
         }.toMap
 
-        // put a name of the val
+        // typecheck idents and replace type variables
         val inlinedBody = c.internal.typingTransform(body)((tree, api) => tree match {
           case i @ Ident(_) if paramsMap contains tree.symbol =>
             val sym = paramsMap(tree.symbol)._1
             api.typecheck(q"$sym")
 
+          case TypeTree() =>
+            val transformedTpe = tree.tpe.map {
+              case TypeRef(prefix, tp, targs) if tparamsMap.contains(tp) =>
+                c.universe.internal.typeRef(prefix, tparamsMap(tp), targs)
+              case tp => tp
+            }
+            TypeTree(transformedTpe)
           case _ =>
             api.default(tree)
         })
 
-        q"""{
+        val res = q"""{
           ..${paramsMap.values.map(_._2)}
           ${c.internal.typingTransform(inlinedBody)(tr)}
         }"""
+        debug("Inlined: " + showCode(res), Inlining)
+        res
       }
 
       def inlineMethod(c: Context)(f: c.Tree, self: c.Tree)(targs: List[c.Type])(args: List[c.Tree]): c.Tree = {
         import c.universe._
         import c.universe.internal._, decorators._
         val q"${ _ } def ${ _ }[..$tparams](...$paramss): $tpe = $body" = f
-        val tpMap = (tparams zip targs).map(x => (x._1.symbol, typeOf[Int])).toMap // TODO
+        val tpMap = (tparams zip targs).map(x => (x._1.symbol, x._2.typeSymbol)).toMap
         inlineTransformed[c.type](c)(body)((tree, api) => tree match {
           case This(_) => self
           case _       => api.default(tree)
@@ -261,47 +268,6 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin {
 
           method
         }
-      }
-
-      def minimize(block: Tree): Tree = {
-        debug("Minimizing:" + block, Minimization)
-        val res = minimize(context)(block.asInstanceOf[context.Tree]).asInstanceOf[Tree]
-        debug("Minimized:" + res, Minimization)
-        res
-      }
-
-      def minimize(c: Context)(block: c.Tree): c.Tree = {
-        import c.universe._
-        import c.universe.internal._, decorators._
-
-        val vals: mutable.Map[Symbol, c.Tree] = mutable.Map()
-        val minimizedBody = c.internal.typingTransform(block) { (tree, api) =>
-          tree match {
-            case q"${ _ } val $valName: ${ _ } = $body" if (!tree.symbol.isParameter) =>
-              val newBody = api.default(body)
-              vals += (tree.symbol -> newBody)
-              q"()"
-            case Ident(x) if (vals.contains(tree.symbol)) =>
-              vals(tree.symbol)
-            case t if !t.attachments.get[Self].isEmpty =>
-              val selfTree = t.attachments.get[Self].get.v.asInstanceOf[c.Tree]
-              t.removeAttachment[Self]
-
-              val res = api.default(t)
-              val newSelf = Self(api.default(selfTree).asInstanceOf[global.Tree])
-              res.updateAttachment(newSelf)
-            case _ =>
-              api.default(tree)
-          }
-        }
-        def removeBlocks(body: Tree): Tree = body match {
-          case Block(_, res) => removeBlocks(res)
-          case _             => body
-        }
-
-        // get rid of the block
-        val noBlocks = removeBlocks(minimizedBody)
-        noBlocks.updateAttachment(Self(noBlocks.asInstanceOf[global.Tree]))
       }
 
       def application(sym: Symbol, tree: Tree, lhs: Tree, args: List[Tree]): Tree = {
@@ -464,13 +430,10 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin {
             // typing the return type
             val returnType = sym.asMethod.returnType
             debug(s"Return type: ${show(returnType)}", AppTpe)
-            // val finalRes = if (variant(res) =:= inline) { // minimize the result
-            val finalRes = localTyper.typed(minimize(res).asInstanceOf[Tree])
-            //} else res
             debug(s"Promoting $returnType to ${variantType(res)}")
             val finalVariant = TypeVariant(promote(returnType, variantType(res)))
-            debug(s"Promoted return type for $finalRes: $finalVariant", AppTpe)
-            finalRes.updateAttachment(finalVariant)
+            debug(s"Promoted return type for $res: $finalVariant", AppTpe)
+            res.updateAttachment(finalVariant)
           } else if (sym.isConstructor && isInline(lhs)) {
             val res = treeCopy.Apply(tree, lhs, promoteArgs)
             val returnType = sym.asMethod.returnType

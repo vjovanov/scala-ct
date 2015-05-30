@@ -18,13 +18,46 @@ class InlineSpec extends FlatSpec with ShouldMatchers {
     @ct def simpleFunction(m: Int): String = if (m > 0) "Positive" else "Negative"
 
     simpleFunction(i1) should be("Positive")
-    (showCode { simpleFunction(i1) }).replaceAll("\\$macro\\$\\d+", "") should be("""if (InlineSpec.this.i1.>(0))
-        |  "Positive"
-        |else
-        |  "Negative" """.stripMargin.trim)
+    (showCode { simpleFunction(i1) }).replaceAll("\\$macro\\$\\d+", "") should be("""{
+    |  val m: Int @ch.epfl.scalact.dynamic = InlineSpec.this.i1;
+    |  if (m.>(0))
+    |    "Positive"
+    |  else
+    |    "Negative"
+    |}""".stripMargin.trim)
   }
 
-  it should "evaluate if statements when there is an inline parameter that is constant" in {
+  it should "properly inline functions with type parameters" in debug {
+    @ct def polyFunction[T <: AnyRef, U >: String](p1: T, p2: U): Tuple2[T, U] = {
+      type NewType = U
+      val x: T = p1
+      val y: NewType = p2
+      new Tuple2(new Tuple2[T, U](x, y)._1, y)
+    }
+
+    showCode(polyFunction("", "")).replaceAll("\\$macro\\$\\d+", "") should be("""{
+      |  val p1: String @ch.epfl.scalact.static = "";
+      |  val p2: String @ch.epfl.scalact.static = "";
+      |  {
+      |    type NewType = Int;
+      |    val x: String @ch.epfl.scalact.static = p1;
+      |    val y: String @ch.epfl.scalact.static = p2;
+      |    new library.Tuple2[Int,NewType](new library.Tuple2[Int,Int](x, y)._1, y)
+      |  }
+      |}""".stripMargin)
+    showCode(polyFunction[String, String]("", "")).replaceAll("\\$macro\\$\\d+", "") should be("""{
+      |  val p1: String @ch.epfl.scalact.static = "";
+      |  val p2: String @ch.epfl.scalact.static = "";
+      |  {
+      |    type NewType = Int;
+      |    val x: String @ch.epfl.scalact.static = p1;
+      |    val y: String @ch.epfl.scalact.static = p2;
+      |    new library.Tuple2[Int,NewType](new library.Tuple2[Int,Int](x, y)._1, y)
+      |  }
+      |}""".stripMargin)
+  }
+
+  /*it should "evaluate if statements when there is an inline parameter that is constant" in {
     @ct def simpleFunction0(m: Int @ct): String = if (m > 0) "Positive" else "Negative"
     @ct def simpleFunction(m: Int @ct): String = simpleFunction0(m)
 
@@ -272,6 +305,6 @@ class InlineSpec extends FlatSpec with ShouldMatchers {
       |  scala.Array.apply(1.0.+(-0.0), 0.0.+(0.0))
       |}""".stripMargin)
 
-  }
+  }*/
 
 }

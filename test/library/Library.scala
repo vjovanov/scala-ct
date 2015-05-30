@@ -82,7 +82,7 @@ class Tuple2[+T, +U](val _1: T, val _2: U) {
 
 import ch.epfl.scalact._
 
-@ctv
+/*@ctv
 object Numeric {
   @ctv implicit def dnum(): Numeric[Double @ctv?] @ct = DoubleNumeric
 }
@@ -146,7 +146,7 @@ object DoubleNumeric extends Numeric[Double] {
   @ctv def fromInt(x: Int @ct?): Double @ct? = x
   @ctv def one: Double@ct? = ct?(1.0)
   @ctv def zero: Double@ct? = ct?(0.0)
-}
+}*/
 
 // What happens to narrowed polymorphic types? @ct? should solve this.
 // Soundness of the whole approach? Read the papers?

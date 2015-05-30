@@ -15,12 +15,12 @@ object ScalaInlineBuild extends Build {
     version              := "0.1.0-SNAPSHOT",
     organization         := "ch.epfl.lamp",
     licenses             := Seq("New BSD" ->
-      url("https://raw.githubusercontent.com/scala-inline/scala-inline/master/LICENCE")),
-    homepage             := Some(url("https://github.com/scala-inline/scala-inline")),
+      url("https://raw.githubusercontent.com/scala-inline/scala-ct/master/LICENCE")),
+    homepage             := Some(url("https://github.com/scala-ct/scala-ct")),
     organizationHomepage := Some(url("http://lamp.epfl.ch")),
     scmInfo              := Some(ScmInfo(
-      url("https://github.com/scala-inline/scala-inline.git"),
-      "scm:git:git://github.com/scala-inline/scala-inline.git"))
+      url("https://github.com/scala-ct/scala-ct.git"),
+      "scm:git:git://github.com/scala-ct/scala-ct.git"))
   )
 
   lazy val scalaSettings = Defaults.defaultSettings ++ Seq(
@@ -42,12 +42,12 @@ object ScalaInlineBuild extends Build {
 
   // modules
   lazy val scalaInline  = Project(
-    id = "scala-inline",
+    id = "scala-ct",
     base = file("."),
-    settings = defaults ++ paradise ++ Seq(name := "scala-inline")
-  ) dependsOn (interpreter)
+    settings = defaults ++ paradise ++ Seq(name := "scala-ct")
+  ) dependsOn (interpreter_)
 
-  lazy val interpreter = ProjectRef(file("./interpreter"), "interpreter")
+  lazy val interpreter_ = ProjectRef(file("./interpreter_"), "interpreter")
 
   lazy val defaults = projectSettings ++ scalaSettings ++ formatSettings ++ libraryDeps ++ Seq(
     resolvers +=  "OSSH" at "https://oss.sonatype.org/content/groups/public",
@@ -68,7 +68,7 @@ object ScalaInlineBuild extends Build {
         val cpath = update.matching(configurationFilter()).classpath ++
           (baseDirectory / "lib" ** "*.jar").classpath
         val interpreter = cpath.files.find(_.getName contains "interpreter").getOrElse(
-          baseDirectory / "interpreter" / "interpreter" / "target" / "scala-2.11" / "classes").absString
+          baseDirectory / "interpreter_" / "interpreter" / "target" / "scala-2.11" / "classes").absString
 
         "-Xplugin:" + p + ":" + interpreter
     },
@@ -82,7 +82,7 @@ object ScalaInlineBuild extends Build {
     libraryDependencies += {
       val paradiseVersion =
         scalaVersion.value match {
-          case "2.11.2" | "2.11.3" | "2.11.4" => "2.0.1"
+          case "2.11.2" | "2.11.3" | "2.11.4" | "2.11.5" => "2.0.1"
           case _ => "2.0.0"
         }
       compilerPlugin("org.scalamacros" % "paradise" %  paradiseVersion cross CrossVersion.full)
@@ -94,7 +94,7 @@ object ScalaInlineBuild extends Build {
     ghpages.settings,
     site.includeScaladoc(),
     site.jekyllSupport(),
-    git.remoteRepo := "git@github.com:scala-inline/scala-inline.git",
+    git.remoteRepo := "git@github.com:scala-ct/scala-ct.git",
     includeFilter in Jekyll := ("*.html" | "*.png" | "*.js" | "*.css" | "CNAME")
   )
 
