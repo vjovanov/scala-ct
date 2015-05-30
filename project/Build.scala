@@ -47,7 +47,7 @@ object ScalaInlineBuild extends Build {
     settings = defaults ++ paradise ++ Seq(name := "scala-ct")
   ) dependsOn (interpreter_)
 
-  lazy val interpreter_ = ProjectRef(file("./interpreter_"), "interpreter")
+  lazy val interpreter_ = ProjectRef(file("./interpreter-old"), "interpreter")
 
   lazy val defaults = projectSettings ++ scalaSettings ++ formatSettings ++ libraryDeps ++ Seq(
     resolvers +=  "OSSH" at "https://oss.sonatype.org/content/groups/public",
@@ -68,7 +68,7 @@ object ScalaInlineBuild extends Build {
         val cpath = update.matching(configurationFilter()).classpath ++
           (baseDirectory / "lib" ** "*.jar").classpath
         val interpreter = cpath.files.find(_.getName contains "interpreter").getOrElse(
-          baseDirectory / "interpreter_" / "interpreter" / "target" / "scala-2.11" / "classes").absString
+          baseDirectory / "interpreter-old" / "interpreter" / "target" / "scala-2.11" / "classes").absString
 
         "-Xplugin:" + p + ":" + interpreter
     },
