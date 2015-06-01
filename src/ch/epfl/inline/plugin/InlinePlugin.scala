@@ -93,10 +93,11 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin {
   case object News extends DebugContext
   case object Blocks extends DebugContext
   case object Inlining extends DebugContext
+  case object Minimization extends DebugContext
 
   var ident = 0
   var debugging = false
-  val debugContexts: Set[DebugContext] = Set()
+  val debugContexts: Set[DebugContext] = Set(Minimization)
   def debug(msg: String, context: DebugContext = Default): Unit =
     if (debugContexts.contains(context) && debugging) println("" * ident + msg)
 
@@ -270,6 +271,47 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin {
         }
       }
 
+      def minimize(block: Tree): Tree = {
+        debug("Minimizing:" + block, Minimization)
+        val res = minimize(context)(block.asInstanceOf[context.Tree]).asInstanceOf[Tree]
+        debug("Minimized:" + res, Minimization)
+        res
+      }
+
+      def minimize(c: Context)(block: c.Tree): c.Tree = {
+        import c.universe._
+        import c.universe.internal._, decorators._
+
+        val vals: mutable.Map[Symbol, c.Tree] = mutable.Map()
+        val minimizedBody = c.internal.typingTransform(block) { (tree, api) =>
+          tree match {
+            case q"${ _ } val $valName: ${ _ } = $body" if (!tree.symbol.isParameter) =>
+              val newBody = api.default(body)
+              vals += (tree.symbol -> newBody)
+              q"()"
+            case Ident(x) if (vals.contains(tree.symbol)) =>
+              vals(tree.symbol)
+            case t if !t.attachments.get[Self].isEmpty =>
+              val selfTree = t.attachments.get[Self].get.v.asInstanceOf[c.Tree]
+              t.removeAttachment[Self]
+
+              val res = api.default(t)
+              val newSelf = Self(api.default(selfTree).asInstanceOf[global.Tree])
+              res.updateAttachment(newSelf)
+            case _ =>
+              api.default(tree)
+          }
+        }
+        def removeBlocks(body: Tree): Tree = body match {
+          case Block(_, res) => removeBlocks(res)
+          case _             => body
+        }
+
+        // get rid of the block
+        val noBlocks = removeBlocks(minimizedBody)
+        noBlocks.updateAttachment(Self(noBlocks.asInstanceOf[global.Tree]))
+      }
+
       def application(sym: Symbol, tree: Tree, lhs: Tree, args: List[Tree]): Tree = {
         // Typechecking
         case class Constraint(tp: Type, level: Int)
@@ -391,7 +433,6 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin {
               // debug(s"Inlined ${sym.owner}.$sym: ${show(res)}: ${variantType(res)}", AppTpe)
               inlined
             } else { // interpretation of the unavailable functions
-              debug(tree.toString)
               val interpretee = treeCopy.Apply(tree, lhs, promoteArgs.map { arg =>
                 val argTree = if (variant(arg) =:= ct) inlineTree(arg)
                 else {
@@ -429,11 +470,9 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin {
 
             // typing the return type
             val returnType = sym.asMethod.returnType
-            debug(s"Return type: ${show(returnType)}", AppTpe)
-            debug(s"Promoting $returnType to ${variantType(res)}")
-            val finalVariant = TypeVariant(promote(returnType, variantType(res)))
-            debug(s"Promoted return type for $res: $finalVariant", AppTpe)
-            res.updateAttachment(finalVariant)
+            debug(s"Return type: ${show(returnType)} promoting to ${variantType(res)}", Minimization)
+            val minimizedRes = if (variant(res) =:= ct) minimize(res) else res
+            minimizedRes.updateAttachment(TypeVariant(promote(returnType, variantType(res))))
           } else if (sym.isConstructor && isInline(lhs)) {
             val res = treeCopy.Apply(tree, lhs, promoteArgs)
             val returnType = sym.asMethod.returnType

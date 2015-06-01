@@ -27,7 +27,7 @@ class InlineSpec extends FlatSpec with ShouldMatchers {
     |}""".stripMargin.trim)
   }
 
-  it should "properly inline functions with type parameters" in debug {
+  it should "properly inline functions with type parameters" in {
     @ct def polyFunction[T <: AnyRef, U >: String](p1: T, p2: U): Tuple2[T, U] = {
       type NewType = U
       val x: T = p1
@@ -57,12 +57,18 @@ class InlineSpec extends FlatSpec with ShouldMatchers {
       |}""".stripMargin)
   }
 
-  /*it should "evaluate if statements when there is an inline parameter that is constant" in {
+  it should "evaluate if statements when there is an inline parameter that is constant" in {
     @ct def simpleFunction0(m: Int @ct): String = if (m > 0) "Positive" else "Negative"
     @ct def simpleFunction(m: Int @ct): String = simpleFunction0(m)
 
     simpleFunction(2) should be("Positive")
-    (showCode { simpleFunction(2) }).replaceAll("\\$macro\\$\\d+", "") should be("\"Positive\"")
+    (showCode { simpleFunction(2) }).replaceAll("\\$macro\\$\\d+", "") should be("""{
+      |  val m: Int @ch.epfl.scalact.ct = 2;
+      |  {
+      |    val m: Int @ch.epfl.scalact.ct = 2;
+      |    "Positive"
+      |  }
+      |}""".stripMargin)
   }
 
   it should "work with recursion" in {
@@ -71,11 +77,63 @@ class InlineSpec extends FlatSpec with ShouldMatchers {
     def exp: Int = 2
     pow(3, 2) should be(9)
 
-    (showCode { pow(3, 2) }).toString.replaceAll("\\$macro\\$\\d+", "") should be("(3).*((3).*(1))")
-    (showCode { pow(base, 2) }).toString.replaceAll("\\$macro\\$\\d+", "") should be("""base.*(base.*(1))""")
+    (showCode { pow(3, 2) }).toString.replaceAll("\\$macro\\$\\d+", "") should be("""{
+      |  val base: Int @ch.epfl.scalact.static = 3;
+      |  val exp: Int @ch.epfl.scalact.ct = 2;
+      |  base.*({
+      |    val base: Int @ch.epfl.scalact.static = base;
+      |    val exp: Int @ch.epfl.scalact.ct = 1;
+      |    base.*({
+      |      val base: Int @ch.epfl.scalact.static = base;
+      |      val exp: Int @ch.epfl.scalact.ct = 0;
+      |      1
+      |    })
+      |  })
+      |}""".stripMargin)
+    (showCode { pow(base, 2) }).toString.replaceAll("\\$macro\\$\\d+", "") should be("""{
+      |  val base: Int @ch.epfl.scalact.dynamic = base;
+      |  val exp: Int @ch.epfl.scalact.ct = 2;
+      |  base.*({
+      |    val base: Int @ch.epfl.scalact.dynamic = base;
+      |    val exp: Int @ch.epfl.scalact.ct = 1;
+      |    base.*({
+      |      val base: Int @ch.epfl.scalact.dynamic = base;
+      |      val exp: Int @ch.epfl.scalact.ct = 0;
+      |      1
+      |    })
+      |  })
+      |}""".stripMargin)
   }
 
-  it should "`inline` should promote to @ct" in {
+  it should "allow composition of functions" in {
+    @ct def fact(f: Int @ct): Long @ct = if (f == 0) ct(1) else f * fact(f - 1)
+
+    fact(5) should be(120)
+    showCode(fact(5)).toString.replaceAll("\\$macro\\$\\d+", "") should be("""120L""")
+
+    @ct def pow(base: Int, exp: Long @ct): Long = if (exp == 0) 1 else base * pow(base, exp - 1)
+
+    val exp = fact(2)
+    pow(2, exp) should be(4)
+    showCode(pow(2, exp)).toString.replaceAll("\\$macro\\$\\d+", "") should be("""{
+      |  val base: Int @ch.epfl.scalact.static = 2;
+      |  val exp: Long @ch.epfl.scalact.ct = 2L;
+      |  base.*({
+      |    val base: Int @ch.epfl.scalact.static = base;
+      |    val exp: Long @ch.epfl.scalact.ct = 1L;
+      |    base.*({
+      |      val base: Int @ch.epfl.scalact.static = base;
+      |      val exp: Long @ch.epfl.scalact.ct = 0L;
+      |      1L
+      |    })
+      |  })
+      |}""".stripMargin)
+  }
+
+  // TODO introduce separate phase of typechecking
+  // Return type promotion should not happen.
+  // Typechecking
+  /*it should "`ct` should promote to @ct" in {
 
     val x = ct(1)
     (x + 1) should be(2)
