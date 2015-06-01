@@ -1,5 +1,7 @@
 package ch.epfl.scalact.plugin
 
+import ch.epfl.scalact.Variant
+
 import scala.reflect.macros.blackbox.Context
 import scala.tools.nsc
 import nsc.Global
@@ -9,97 +11,69 @@ import nsc.plugins.PluginComponent
 import scala.collection.mutable
 import scala.reflect.interpreter._
 
-class PartialEvaluationPlugin(val global: Global) extends Plugin {
+class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginCommon {
   import global._
-
-  case class TypeVariant(tpe: Type)
-  case class Self(v: Tree)
-
-  val (ct, ctstatic, static, dynamic) =
-    (typeOf[ch.epfl.scalact.ct],
-      typeOf[ch.epfl.scalact.ctstatic],
-      typeOf[ch.epfl.scalact.static],
-      typeOf[ch.epfl.scalact.dynamic])
-  val variants = Set(ct, ctstatic, static, dynamic)
-
-  object Variant {
-    def unapply(x: Any): Option[(Type, Type)] = x match {
-      case t: Tree if t.attachments.contains[TypeVariant] => unapply(t.attachments.get[TypeVariant].get.tpe)
-      case AnnotatedType(List(Annotation(tpe, _, _), _*), t) if variants.exists(_ =:= tpe) => Some(t, tpe)
-      case t: Type => Some(t, dynamic)
-      case t: Tree => Some(t.tpe, dynamic)
-    }
-  }
-
-  def variant(tree: Any): Type = tree match {
-    case Variant(_, y) => y
-  }
-
-  /*
-   * Convenience method for traversing annotated types.
-   */
-  def mapType(tpe: Type, f: (Type, Type) => Type): Type = tpe.widen match {
-    case TypeRef(prefix, tp, args) if tp.isTypeParameter => // TODO find a better way
-      TypeRef(prefix, tp, args)
-
-    case TypeRef(prefix, tp, args) =>
-      AnnotatedType(List(AnnotationInfo(f(dynamic, tpe), Nil, Nil)), TypeRef(prefix, tp, args.map(mapType(_, f))))
-
-    case AnnotatedType(List(Annotation(annTpe, _, _), _*), TypeRef(prefix, tp, args)) if variants.exists(_ =:= annTpe) =>
-      AnnotatedType(List(AnnotationInfo(f(annTpe, tpe), Nil, Nil)), TypeRef(prefix, tp, args.map(mapType(_, f))))
-
-    case MethodType(l, resTp) => // TODO not sure about this
-      AnnotatedType(List(AnnotationInfo(f(dynamic, tpe), Nil, Nil)), MethodType(l, mapType(resTp, f)))
-
-    case NullaryMethodType(_) => // TODO do not know how to handle this
-      tpe.widen
-
-    case PolyType(vars, tpe) =>
-      AnnotatedType(List(AnnotationInfo(f(dynamic, tpe), Nil, Nil)), PolyType(vars, mapType(tpe, f)))
-
-    case _ => throw new RuntimeException("Unexpected Type " + showRaw(tpe))
-  }
-
-  def promoteType(tpe: Type, to: Type): Type = mapType(tpe, (_, tpe) => to)
-
-  def promoteOne(tpe: Type, to: Type): Type =
-    AnnotatedType(List(AnnotationInfo(to, Nil, Nil)), tpe)
-
-  object MultipleApply {
-    def unapply(value: Tree): Option[(Tree, List[Tree])] = value match {
-      case Apply(x, y) =>
-        Some(x match {
-          case MultipleApply(rx, ry) =>
-            (rx, ry ::: y)
-          case _ =>
-            (x, y)
-        })
-      case _ => None
-    }
-  }
 
   val name = "partial-evaluation"
   val description = "Partially evaluates Scala trees according to the type annotations."
-  val components = List[PluginComponent](Component)
+  val components = List[PluginComponent](BTTyper, Component)
 
-  sealed trait DebugContext
-  case object Default extends DebugContext
-  case object AppTpe extends DebugContext
-  case object Interpreter extends DebugContext
-  case object ValDefs extends DebugContext
-  case object IfStatement extends DebugContext
-  case object Idents extends DebugContext
-  case object SelectContext extends DebugContext
-  case object News extends DebugContext
-  case object Blocks extends DebugContext
-  case object Inlining extends DebugContext
-  case object Minimization extends DebugContext
+  /**
+   * Performs binding time analysis and coercion.
+   */
+  private object BTTyper extends PluginComponent with TypingTransformers with Transform {
+    val global: PartialEvaluationPlugin.this.global.type = PartialEvaluationPlugin.this.global
+    val runsAfter = List[String]("typer")
+    val phaseName = "bt-typer"
+    def newTransformer(unit: CompilationUnit) = new BTTyperTransformer(unit)
+    case class BTContext(constructor: Boolean, tparams: Set[Symbol], selfBT: Type)
+    var ctx = BTContext(false, Set.empty, dynamic) // expected type
+    def withCtx[T](newCtx: BTContext)(t: => T): T = {
+      val oldCtx = ctx
+      ctx = newCtx
+      val res = t
+      ctx = oldCtx
+      res
+    }
 
-  var ident = 0
-  var debugging = false
-  val debugContexts: Set[DebugContext] = Set(Minimization)
-  def debug(msg: String, context: DebugContext = Default): Unit =
-    if (debugContexts.contains(context) && debugging) println("" * ident + msg)
+    class BTTyperTransformer(unit: CompilationUnit) extends TypingTransformer(unit) {
+      override def transform(tree: Tree): Tree = withIdent(1) {
+        val res = tree match {
+          case pd @ PackageDef(refTree, body) => treeCopy.PackageDef(tree, refTree, body.map(transform))
+          case Import(_, _)                   => tree
+
+          case ClassDef(mods, name, tparams, tmpl) =>
+            treeCopy.ClassDef(tree, mods, name, tparams, withCtx(ctx.copy(constructor = true, tparams = ctx.tparams ++ tparams.map(_.symbol))) { transformTemplate(tmpl) })
+
+          case ModuleDef(mods, name, tmpl)   => treeCopy.ModuleDef(tree, mods, name, transformTemplate(tmpl))
+          case Template(parents, self, body) => treeCopy.Template(tree, parents.map(transform), transformValDef(self), body.map(transform))
+          case Select(qual, name)            => treeCopy.Select(tree, transform(qual), name)
+          case Ident(i)                      => treeCopy.Ident(tree, i)
+          case TypeTree()                    => treeCopy.TypeTree(tree)
+
+          case DefDef(mods, name, tparams, vparamss, tpt, rhs) => // assume parameters if the type is not in the list!
+            treeCopy.DefDef(tree, mods, name, tparams, vparamss, tpt, transform(rhs))
+
+          case Block(stats, expr)                => treeCopy.Block(tree, stats.map(transform), transform(expr))
+          case Apply(fun, args)                  => treeCopy.Apply(tree, transform(fun), args.map(transform))
+          case Super(qual, mix)                  => treeCopy.Super(tree, transform(qual), mix)
+          case This(qual)                        => treeCopy.This(tree, qual)
+          case Literal(Constant(a))              => tree
+          case ValDef(mods, name, tpt, rhs)      => treeCopy.ValDef(tree, mods, name, tpt, rhs)
+          case If(cond, thenp, elsep)            => treeCopy.If(tree, transform(cond), transform(thenp), transform(elsep))
+          case Throw(expr)                       => treeCopy.Throw(tree, expr)
+          case TypeDef(mods, name, tparams, rhs) => treeCopy.TypeDef(tree, mods, name, tparams, transform(rhs))
+          case New(tpt)                          => treeCopy.New(tree, tpt)
+          case TypeApply(fun, args)              => treeCopy.TypeApply(tree, transform(fun), args)
+          case Function(vparams, body)           => treeCopy.Function(tree, vparams, transform(body))
+          case EmptyTree                         => tree
+          case _                                 => ???
+        }
+        if (unit.body == tree) debug(s"$tree \n becomes \n $res", TypeChecking)
+        res
+      }
+    }
+  }
 
   private object Component extends PluginComponent with TypingTransformers with Transform {
     val global: PartialEvaluationPlugin.this.global.type = PartialEvaluationPlugin.this.global
@@ -130,8 +104,7 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin {
       }
 
       def variantType(tree: Tree): Type = tree match {
-        case t: Tree if t.attachments.contains[TypeVariant] =>
-          t.attachments.get[TypeVariant].get.tpe
+        case t: Tree if t.attachments.contains[TypeVariant]  => t.attachments.get[TypeVariant].get.tpe
         case Ident(_) if promotedTypes.contains(tree.symbol) => variantType(promotedTypes(tree.symbol)._1)
         case Ident(_)                                        => promoteType(tree.tpe, dynamic)
         case _ =>
@@ -162,7 +135,7 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin {
           case (param @ q"${ _ } val $name: ${ _ } = ${ _ }", arg) =>
             val temp = c.freshName(name)
             val tempSym = localTyper.context.owner.asInstanceOf[Symbol].newTermSymbol(temp)
-            val newArg = c.typecheck(arg) // typer does not set the type sometimes :/
+            val newArg = c.typecheck(arg)
             tempSym.setInfo(newArg.tpe.widen)
 
             val valDef = c.internal.valDef(tempSym, c.internal.changeOwner(arg, c.internal.enclosingOwner, tempSym))
@@ -491,9 +464,8 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin {
       var inlineLevel: Int = 0
       def byMode(tp: Type) = if (inlineLevel == 0) tp else ct
 
-      override def transform(tree: Tree): Tree = {
-        ident += 1
-        val res = tree match {
+      override def transform(tree: Tree): Tree = withIdent(0) {
+        tree match {
           // TODO Gross Hack (we need access to underlying objects here or in the interpreter)
           case q"$x == $y" if y.tpe.toString == "library.Nil.type" =>
             if (x.tpe.toString == y.tpe.toString && y.tpe.toString == "library.Nil.type")
@@ -662,8 +634,6 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin {
           case _ =>
             super.transform(tree)
         }
-        ident -= 1
-        res
       }
     }
   }
