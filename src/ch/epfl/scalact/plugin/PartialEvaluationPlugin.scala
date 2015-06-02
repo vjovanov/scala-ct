@@ -1,6 +1,7 @@
 package ch.epfl.scalact.plugin
 
-import ch.epfl.scalact.Variant
+import ch.epfl.scalact
+import ch.epfl.scalact._
 
 import scala.reflect.macros.blackbox.Context
 import scala.tools.nsc
@@ -18,6 +19,12 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
   val description = "Partially evaluates Scala trees according to the type annotations."
   val components = List[PluginComponent](BTTyper, Component)
 
+  var varCnt = 0
+  def freshVar(): BTVar = {
+    varCnt += 1
+    BTVar("c" + varCnt)
+  }
+
   /**
    * Performs binding time analysis and coercion.
    */
@@ -26,8 +33,19 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
     val runsAfter = List[String]("typer")
     val phaseName = "bt-typer"
     def newTransformer(unit: CompilationUnit) = new BTTyperTransformer(unit)
-    case class BTContext(constructor: Boolean, tparams: Set[Symbol], selfBT: Type)
-    var ctx = BTContext(false, Set.empty, dynamic) // expected type
+
+    case class BTContext(
+      constructor: Boolean = false,
+      tparams: Set[Symbol] = Set.empty,
+      selfBT: Type = dynamic,
+      btParams: Map[Symbol, BTVar] = Map.empty,
+      outer: List[Symbol] = Nil) {
+      def addParam(sym: Symbol, p: BTVar) =
+        copy(btParams = btParams + ((sym, p)))
+
+    }
+
+    var ctx = BTContext() // expected type
     def withCtx[T](newCtx: BTContext)(t: => T): T = {
       val oldCtx = ctx
       ctx = newCtx
@@ -43,16 +61,56 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
           case Import(_, _)                   => tree
 
           case ClassDef(mods, name, tparams, tmpl) =>
-            treeCopy.ClassDef(tree, mods, name, tparams, withCtx(ctx.copy(constructor = true, tparams = ctx.tparams ++ tparams.map(_.symbol))) { transformTemplate(tmpl) })
+            val tmpCtx = ctx.copy(
+              tparams = ctx.tparams ++ tparams.map(_.symbol),
+              outer = tree.tpe.typeSymbol :: ctx.outer)
+            val newVars =
+              tparams.map(_.symbol).foldLeft(Map.empty[Symbol, BTVar])((agg, v) => agg + ((v, freshVar()))) +
+                ((tree.tpe.typeSymbol, freshVar()))
+            val newCtx = newVars.foldLeft(tmpCtx)((ctx, v) => ctx addParam (v._1, v._2))
 
-          case ModuleDef(mods, name, tmpl)   => treeCopy.ModuleDef(tree, mods, name, transformTemplate(tmpl))
+            val res = treeCopy.ClassDef(tree, mods, name, tparams, withCtx(newCtx) { transformTemplate(tmpl) })
+
+            val annotArgs = newVars.map(v => localTyper.typed(q"${v._2.toString}"))
+            res.symbol.addAnnotation(AnnotationInfo(typeOf[BTParams], annotArgs.toList, Nil))
+            res
+
+          case ModuleDef(mods, name, tmpl) =>
+            val newCtx = ctx.copy(outer = tree.symbol :: ctx.outer)
+              .addParam(tree.symbol, freshVar())
+
+            treeCopy.ModuleDef(tree, mods, name, withCtx(newCtx)(transformTemplate(tmpl)))
+
           case Template(parents, self, body) => treeCopy.Template(tree, parents.map(transform), transformValDef(self), body.map(transform))
           case Select(qual, name)            => treeCopy.Select(tree, transform(qual), name)
           case Ident(i)                      => treeCopy.Ident(tree, i)
           case TypeTree()                    => treeCopy.TypeTree(tree)
 
-          case DefDef(mods, name, tparams, vparamss, tpt, rhs) => // assume parameters if the type is not in the list!
-            treeCopy.DefDef(tree, mods, name, tparams, vparamss, tpt, transform(rhs))
+          case DefDef(mods, name, tparams, vparamss, tpt, rhs) =>
+            val tmpCtx = ctx.copy(tparams = ctx.tparams ++ tparams.map(_.symbol))
+            val newVars =
+              tparams.map(_.symbol).foldLeft(Map.empty[Symbol, BTVar])((agg, v) => agg + ((v, freshVar())))
+            val newCtx = newVars.foldLeft(tmpCtx)((ctx, v) => ctx addParam (v._1, v._2))
+
+            // TODO verify the subtyping relations
+            // TODO introduce annotations to parameters
+            // TODO introduce annotations to result types
+            val res = treeCopy.DefDef(tree, mods, name, tparams, vparamss, tpt, withCtx(newCtx)(transform(rhs)))
+
+            // add bt variables to function
+            if (newVars.nonEmpty) {
+              val annotArgs = newVars.map(v => localTyper.typed(q"${v._2.toString}"))
+              res.symbol.addAnnotation(AnnotationInfo(typeOf[BTParams], annotArgs.toList, Nil))
+            }
+
+            // add constraints (user annotation + all outer classes)
+            val userAnnotation = if (functionAnnotation(tree.symbol) =:= ct) BTConst(ct) else BTConst(bot)
+            val constraints: BT = Meet(ctx.outer.tail.foldLeft[BT](ctx.btParams(ctx.outer.head)) { (agg, v) =>
+              Meet(agg, ctx.btParams(v))
+            }, userAnnotation)
+            res.symbol.addAnnotation(AnnotationInfo(typeOf[BT], List(localTyper.typed(q"${constraints.toString}")), Nil))
+
+            res
 
           case Block(stats, expr)                => treeCopy.Block(tree, stats.map(transform), transform(expr))
           case Apply(fun, args)                  => treeCopy.Apply(tree, transform(fun), args.map(transform))
@@ -69,7 +127,7 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
           case EmptyTree                         => tree
           case _                                 => ???
         }
-        if (unit.body == tree) debug(s"$tree \n becomes \n $res", TypeChecking)
+        //        if (unit.body == tree) debug(s"$tree \n becomes \n $res", TypeChecking)
         res
       }
     }
@@ -210,12 +268,6 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
         finalRes
       }
 
-      def functionAnnotation(methodSym: Symbol): Type = {
-        val allVariants = methodSym.annotations.filter(_.tree.tpe <:< typeOf[ch.epfl.scalact.Variant])
-        if (allVariants.size > 1) error("Function should have only one ct argument.")
-        allVariants.headOption.map(_.tree.tpe).getOrElse(dynamic)
-      }
-
       /*
        * Fetching sources.
        */
@@ -303,6 +355,7 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
           }
         }
         debug(s"------------------------------ ${sym.owner}.${sym.name} ---------------------------------")
+
         val constraints = (sym.asMethod.paramLists.flatten.map(_.tpe) zip args.map(variantType))
           .foldLeft(Map[Symbol, Set[Constraint]]())((agg, x) => compose(agg, (params _).tupled(x)))
 
@@ -334,8 +387,6 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
             val newArgs = (pargs zip args).map(tps => (coaerce _).tupled(tps))
             if (!(variantA =:= dynamic) && expectedVariant <:< variantA)
               promoteOne(TypeRef(prefix, tpe, newArgs), expectedVariant)
-            else if (expectedVariant =:= ctstatic && variantA =:= static)
-              promoteOne(TypeRef(prefix, tpe, newArgs), ct)
             else promoteOne(TypeRef(prefix, tpe, newArgs), variantA)
         }
 
@@ -358,9 +409,7 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
         }.getOrElse(sym)
 
         val shouldInline = !sym.isConstructor &&
-          (functionAnnotation(methodSym) =:= ct || // explicitly annotated
-            // TODO Discuss with Denys what to do here... TODO Refine for nested types.
-            (functionAnnotation(methodSym) =:= ctstatic && (expectedTypes zip args).forall(x => !(variant(x._1) =:= ctstatic) || variant(x._2) =:= ct)) || // function is ctstatic and all ctstatic args are satisfied
+          (functionAnnotation(methodSym) =:= ct || // substituted and simplified BT term is BTConst(CT)
             isInline(lhs)) // lhs is promoted to inline (type checking checks the arguments)
         debug(s"Method body fetching: " + lhs.attachments.get[Self] + " " + methodSym.owner + " " + functionAnnotation(methodSym) + " " + lhs)
         def withInline[T](cond: Boolean)(block: => T): T = {
@@ -563,8 +612,8 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
             val paramssTypes = vparams.map(p => p.map { case ValDef(_, _, tpe, _) => tpe })
             // for now treating only non-curried functions
             val skipFunction = paramssTypes.exists(_.exists(_.tpe.exists {
-              case Variant(_, v @ (`ct` | `ctstatic`)) => true
-              case _                                   => false
+              case Variant(_, v @ `ct`) => true
+              case _                    => false
             }))
             if (skipFunction) tree else super.transform(tree)
 

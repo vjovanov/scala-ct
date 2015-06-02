@@ -19,7 +19,7 @@ class InlineSpec extends FlatSpec with ShouldMatchers {
 
     simpleFunction(i1) should be("Positive")
     (showCode { simpleFunction(i1) }).replaceAll("\\$macro\\$\\d+", "") should be("""{
-    |  val m: Int @ch.epfl.scalact.dynamic = InlineSpec.this.i1;
+    |  val m: Int @ch.epfl.scalact.rt = InlineSpec.this.i1;
     |  if (m.>(0))
     |    "Positive"
     |  else
@@ -91,13 +91,13 @@ class InlineSpec extends FlatSpec with ShouldMatchers {
       |  })
       |}""".stripMargin)
     (showCode { pow(base, 2) }).toString.replaceAll("\\$macro\\$\\d+", "") should be("""{
-      |  val base: Int @ch.epfl.scalact.dynamic = base;
+      |  val base: Int @ch.epfl.scalact.rt = base;
       |  val exp: Int @ch.epfl.scalact.ct = 2;
       |  base.*({
-      |    val base: Int @ch.epfl.scalact.dynamic = base;
+      |    val base: Int @ch.epfl.scalact.rt = base;
       |    val exp: Int @ch.epfl.scalact.ct = 1;
       |    base.*({
-      |      val base: Int @ch.epfl.scalact.dynamic = base;
+      |      val base: Int @ch.epfl.scalact.rt = base;
       |      val exp: Int @ch.epfl.scalact.ct = 0;
       |      1
       |    })

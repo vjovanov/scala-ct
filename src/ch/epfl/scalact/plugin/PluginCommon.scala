@@ -1,5 +1,8 @@
 package ch.epfl.scalact.plugin
 
+import ch.epfl.scalact._
+
+import scala.annotation.StaticAnnotation
 import scala.tools.nsc.Global
 
 trait PluginCommon {
@@ -8,12 +11,63 @@ trait PluginCommon {
   case class TypeVariant(tpe: Type)
   case class Self(v: Tree)
 
-  val (ct, ctstatic, static, dynamic) =
-    (typeOf[ch.epfl.scalact.ct],
-      typeOf[ch.epfl.scalact.ctstatic],
-      typeOf[ch.epfl.scalact.static],
-      typeOf[ch.epfl.scalact.dynamic])
-  val variants = Set(ct, ctstatic, static, dynamic)
+  val (top, dynamic, ct, bot) =
+    (typeOf[ch.epfl.scalact.top],
+      typeOf[ch.epfl.scalact.rt],
+      typeOf[ch.epfl.scalact.ct],
+      typeOf[ch.epfl.scalact.bot])
+  // TODO eliminate
+  val static = typeOf[ch.epfl.scalact.static]
+  val variants = Set(ct, static, dynamic)
+
+  object BT extends StaticAnnotation {
+    def apply(bt: String): BT = {
+      val terms = bt.split("").map(parseTerm)
+      terms.tail.foldLeft[BT](terms.head)((agg, v) => Meet(agg, v))
+    }
+
+    private final def parseTerm(t: String) = t match {
+      case "ct" => BTConst(ct)
+      case "rt" => BTConst(dynamic)
+      case x    => BTVar(x)
+    }
+  }
+
+  trait BT {
+    def simplify: BT
+    def substitute(vars: Map[String, Type]): BT
+    def solve(vars: Map[String, Type] = Map.empty): BT = substitute(vars).simplify
+  }
+  final case class BTVar(name: String) extends BT {
+    override def toString: String = name
+    def simplify: BT = throw new RuntimeException(s"Variable $this is not substituted!")
+    def substitute(vars: Map[String, Type]): BT =
+      vars.get(name).map(BTConst).getOrElse(this)
+  }
+  final case class BTConst(bt: Type) extends BT {
+    override def toString: String = bt.toString()
+    def simplify: BT = this
+    def substitute(vars: Map[String, Type]): BT = this
+  }
+  final case class Meet(bt1: BT, bt2: BT) extends BT {
+    override def toString: String = s"$bt1 & $bt2"
+
+    def substitute(vars: Map[String, Type]): BT =
+      Meet(bt1.substitute(vars), bt2.substitute(vars))
+
+    override def simplify: BT = this match {
+      case Meet(BTConst(c1), BTConst(c2)) => BTConst(lub(c1 :: c2 :: Nil))
+    }
+  }
+  final case class Join(bt1: BT, bt2: BT) extends BT {
+    override def toString: String = s"$bt1 | $bt2"
+    def substitute(vars: Map[String, Type]): BT =
+      Join(bt1.substitute(vars), bt2.substitute(vars))
+
+    override def simplify: BT = this match {
+      case Join(BTConst(c1), BTConst(c2)) => BTConst(glb(c1 :: c2 :: Nil))
+    }
+  }
 
   object Variant {
     def unapply(x: Any): Option[(Type, Type)] = x match {
@@ -26,6 +80,35 @@ trait PluginCommon {
 
   def variant(tree: Any): Type = tree match {
     case Variant(_, y) => y
+  }
+
+  def functionAnnotation(methodSym: Symbol): Type = {
+    val allVariants = methodSym.annotations.filter(_.tree.tpe <:< typeOf[ch.epfl.scalact.Variant])
+    if (allVariants.size > 1) error("Function should have only one ct argument.")
+    allVariants.headOption.map(_.tree.tpe).getOrElse(dynamic)
+  }
+
+  def btAnnotation(methodSym: Symbol): BT = {
+    val allBT = methodSym.annotations.filter(_.tree.tpe <:< typeOf[ch.epfl.scalact.BT])
+    if (allBT.size > 1) error("Function should have one BT annotation.")
+    allBT.headOption.map(_.tree).map { case Literal(Constant(c: String)) => BT(c) }.get
+  }
+
+  implicit def variantLiftable[T <: Variant]: Liftable[T] = new Liftable[T] {
+    override def apply(value: T): global.Tree = value match {
+      case b: top     => q"new _root_.ch.epfl.scalact.top"
+      case b: dynamic => q"new _root_.ch.epfl.scalact.dynamic"
+      case b: ct      => q"new _root_.ch.epfl.scalact.ct"
+      case b: bot     => q"new _root_.ch.epfl.scalact.bot"
+    }
+  }
+
+  implicit def btLiftable[T <: BT]: Liftable[T] = new Liftable[T] {
+    override def apply(value: T): global.Tree = value match {
+      case Meet(l: T, r: T) => q"_root_.ch.epfl.scalact.Meet(${apply(l)}, ${apply(r)})"
+      case BTConst(c)       => q"_root_.ch.epfl.scalact.BTConst($c)"
+      case BTVar(name)      => q"_root_.ch.epfl.scalact.BTVar($name)"
+    }
   }
 
   /*
@@ -93,8 +176,8 @@ trait PluginCommon {
     res
   }
 
-  var debugging = false
-  val debugContexts: Set[DebugContext] = Set(Minimization)
+  var debugging = true
+  val debugContexts: Set[DebugContext] = Set(TypeChecking)
   def debug(msg: String, context: DebugContext = Default): Unit =
     if (debugContexts.contains(context) && debugging) println("" * ident + msg)
 
