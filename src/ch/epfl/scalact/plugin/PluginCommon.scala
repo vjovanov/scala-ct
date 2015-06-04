@@ -11,14 +11,11 @@ trait PluginCommon {
   case class TypeVariant(tpe: Type)
   case class Self(v: Tree)
 
-  val (top, dynamic, ct, bot) =
-    (typeOf[ch.epfl.scalact.top],
-      typeOf[ch.epfl.scalact.rt],
-      typeOf[ch.epfl.scalact.ct],
-      typeOf[ch.epfl.scalact.bot])
+  val (rt, ct) = (typeOf[ch.epfl.scalact.rt], typeOf[ch.epfl.scalact.ct])
+  val (bot, top) = (ct, rt)
   // TODO eliminate
   val static = typeOf[ch.epfl.scalact.static]
-  val variants = Set(ct, static, dynamic)
+  val variants = Set(ct, static, rt)
 
   object BT extends StaticAnnotation {
     def apply(bt: String): BT = {
@@ -28,7 +25,7 @@ trait PluginCommon {
 
     private final def parseTerm(t: String) = t match {
       case "ct" => BTConst(ct)
-      case "rt" => BTConst(dynamic)
+      case "rt" => BTConst(rt)
       case x    => BTVar(x)
     }
   }
@@ -45,7 +42,10 @@ trait PluginCommon {
       vars.get(name).map(BTConst).getOrElse(this)
   }
   final case class BTConst(bt: Type) extends BT {
-    override def toString: String = bt.toString()
+    override def toString: String = bt match {
+      case `ct` => "`ct"
+      case `rt` => "`rt"
+    }
     def simplify: BT = this
     def substitute(vars: Map[String, Type]): BT = this
   }
@@ -72,9 +72,13 @@ trait PluginCommon {
   object Variant {
     def unapply(x: Any): Option[(Type, Type)] = x match {
       case t: Tree if t.attachments.contains[TypeVariant] => unapply(t.attachments.get[TypeVariant].get.tpe)
-      case AnnotatedType(List(Annotation(tpe, _, _), _*), t) if variants.exists(_ =:= tpe) => Some(t, tpe)
-      case t: Type => Some(t, dynamic)
-      case t: Tree => Some(t.tpe, dynamic)
+
+      case AnnotatedType(l, t) if l.exists(ann => variants.exists(_ =:= ann.atp)) =>
+        val tpe = l.find(ann => variants.exists(_ =:= ann.atp)).head.atp
+        Some(t, tpe)
+
+      case t: Type => Some(t, rt)
+      case t: Tree => Some(t.tpe, rt)
     }
   }
 
@@ -85,7 +89,7 @@ trait PluginCommon {
   def functionAnnotation(methodSym: Symbol): Type = {
     val allVariants = methodSym.annotations.filter(_.tree.tpe <:< typeOf[ch.epfl.scalact.Variant])
     if (allVariants.size > 1) error("Function should have only one ct argument.")
-    allVariants.headOption.map(_.tree.tpe).getOrElse(dynamic)
+    allVariants.headOption.map(_.tree.tpe).getOrElse(rt)
   }
 
   def btAnnotation(methodSym: Symbol): BT = {
@@ -93,22 +97,9 @@ trait PluginCommon {
     if (allBT.size > 1) error("Function should have one BT annotation.")
     allBT.headOption.map(_.tree).map { case Literal(Constant(c: String)) => BT(c) }.get
   }
-
-  implicit def variantLiftable[T <: Variant]: Liftable[T] = new Liftable[T] {
-    override def apply(value: T): global.Tree = value match {
-      case b: top     => q"new _root_.ch.epfl.scalact.top"
-      case b: dynamic => q"new _root_.ch.epfl.scalact.dynamic"
-      case b: ct      => q"new _root_.ch.epfl.scalact.ct"
-      case b: bot     => q"new _root_.ch.epfl.scalact.bot"
-    }
-  }
-
-  implicit def btLiftable[T <: BT]: Liftable[T] = new Liftable[T] {
-    override def apply(value: T): global.Tree = value match {
-      case Meet(l: T, r: T) => q"_root_.ch.epfl.scalact.Meet(${apply(l)}, ${apply(r)})"
-      case BTConst(c)       => q"_root_.ch.epfl.scalact.BTConst($c)"
-      case BTVar(name)      => q"_root_.ch.epfl.scalact.BTVar($name)"
-    }
+  def userAugmented(constraints: BT, annTpe: Type) = annTpe match {
+    case `ct` => Join(constraints, BTConst(ct))
+    case `rt` => Meet(constraints, BTConst(rt))
   }
 
   /*
@@ -119,19 +110,24 @@ trait PluginCommon {
       TypeRef(prefix, tp, args)
 
     case TypeRef(prefix, tp, args) =>
-      AnnotatedType(List(AnnotationInfo(f(dynamic, tpe), Nil, Nil)), TypeRef(prefix, tp, args.map(mapType(_, f))))
+      AnnotatedType(List(AnnotationInfo(f(rt, tpe), Nil, Nil)), TypeRef(prefix, tp, args.map(mapType(_, f))))
 
-    case AnnotatedType(List(Annotation(annTpe, _, _), _*), TypeRef(prefix, tp, args)) if variants.exists(_ =:= annTpe) =>
-      AnnotatedType(List(AnnotationInfo(f(annTpe, tpe), Nil, Nil)), TypeRef(prefix, tp, args.map(mapType(_, f))))
+    case AnnotatedType(l, TypeRef(prefix, tp, args)) if l.exists(ann => variants.exists(_ =:= ann.atp)) =>
+      val annList = l.filter(ann => variants.exists(_ =:= ann.atp))
+      val annTpe = annList.head.atp
+
+      AnnotatedType(
+        AnnotationInfo(f(annTpe, tpe), Nil, Nil) :: (l diff annList),
+        TypeRef(prefix, tp, args.map(mapType(_, f))))
 
     case MethodType(l, resTp) => // TODO not sure about this
-      AnnotatedType(List(AnnotationInfo(f(dynamic, tpe), Nil, Nil)), MethodType(l, mapType(resTp, f)))
+      AnnotatedType(List(AnnotationInfo(f(rt, tpe), Nil, Nil)), MethodType(l, mapType(resTp, f)))
 
     case NullaryMethodType(_) => // TODO do not know how to handle this
       tpe.widen
 
     case PolyType(vars, tpe) =>
-      AnnotatedType(List(AnnotationInfo(f(dynamic, tpe), Nil, Nil)), PolyType(vars, mapType(tpe, f)))
+      AnnotatedType(List(AnnotationInfo(f(rt, tpe), Nil, Nil)), PolyType(vars, mapType(tpe, f)))
 
     case _ => throw new RuntimeException("Unexpected Type " + showRaw(tpe))
   }

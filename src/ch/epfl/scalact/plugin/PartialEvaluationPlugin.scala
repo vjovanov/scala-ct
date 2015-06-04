@@ -37,7 +37,7 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
     case class BTContext(
       constructor: Boolean = false,
       tparams: Set[Symbol] = Set.empty,
-      selfBT: Type = dynamic,
+      selfBT: Type = rt,
       btParams: Map[Symbol, BTVar] = Map.empty,
       outer: List[Symbol] = Nil) {
       def addParam(sym: Symbol, p: BTVar) =
@@ -55,6 +55,46 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
     }
 
     class BTTyperTransformer(unit: CompilationUnit) extends TypingTransformer(unit) {
+
+      def btAnnot(constraints: BT): AnnotationInfo = AnnotationInfo(typeOf[ch.epfl.scalact.BT], List(localTyper.typed(q"${constraints.toString}")), Nil)
+
+      def annotate(tpe: Type): Type = {
+        val constraints: BT = ctx.outer.tail.foldLeft[BT](ctx.btParams(ctx.outer.head)) { (agg, v) =>
+          Meet(agg, ctx.btParams(v))
+        }
+        tpe.widen.dealias match {
+          case TypeRef(prefix, tp, args) if tp.isTypeParameter =>
+            AnnotatedType(List(btAnnot(ctx.btParams(tp))), TypeRef(prefix, tp, args.map(annotate)))
+
+          case TypeRef(prefix, tp, args) =>
+            AnnotatedType(List(btAnnot(constraints)), TypeRef(prefix, tp, args.map(annotate)))
+
+          case AnnotatedType(l, TypeRef(prefix, tp, args)) if l.exists(ann => variants.exists(_ =:= ann.atp)) =>
+            val annList = l.filter(ann => variants.exists(_ =:= ann.atp))
+            val annTpe = annList.head.atp
+
+            val userConstraints = userAugmented(constraints, annTpe)
+
+            AnnotatedType(btAnnot(userConstraints) :: l, TypeRef(prefix, tp, args.map(annotate)))
+
+          case MethodType(l, resTp) => ???
+
+          case NullaryMethodType(_) => ???
+
+          case PolyType(vars, tpe) =>
+            AnnotatedType(List(btAnnot(constraints)), PolyType(vars, annotate(tpe)))
+
+          case _ => throw new RuntimeException("Unexpected Type " + showRaw(tpe))
+        }
+      }
+
+      def annotate(t: Tree): TypeTree = t match {
+        case tt: TypeTree => TypeTree(annotate(tt.tpe))
+        case _            => ???
+      }
+
+      def annotate(s: Symbol, constraints: BT): Symbol = ???
+
       override def transform(tree: Tree): Tree = withIdent(1) {
         val res = tree match {
           case pd @ PackageDef(refTree, body) => treeCopy.PackageDef(tree, refTree, body.map(transform))
@@ -93,9 +133,11 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
             val newCtx = newVars.foldLeft(tmpCtx)((ctx, v) => ctx addParam (v._1, v._2))
 
             // TODO verify the subtyping relations
-            // TODO introduce annotations to parameters
+            // TODO return type based on blocks
+            // TODO expected type
+            val newParamss = vparamss.map(_.map(p => treeCopy.ValDef(p, p.mods, p.name, annotate(p.tpt), p.rhs)))
+            val res = treeCopy.DefDef(tree, mods, name, tparams, newParamss, annotate(tpt), withCtx(newCtx)(transform(rhs)))
             // TODO introduce annotations to result types
-            val res = treeCopy.DefDef(tree, mods, name, tparams, vparamss, tpt, withCtx(newCtx)(transform(rhs)))
 
             // add bt variables to function
             if (newVars.nonEmpty) {
@@ -103,13 +145,14 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
               res.symbol.addAnnotation(AnnotationInfo(typeOf[BTParams], annotArgs.toList, Nil))
             }
 
-            // add constraints (user annotation + all outer classes)
-            val userAnnotation = if (functionAnnotation(tree.symbol) =:= ct) BTConst(ct) else BTConst(bot)
-            val constraints: BT = Meet(ctx.outer.tail.foldLeft[BT](ctx.btParams(ctx.outer.head)) { (agg, v) =>
-              Meet(agg, ctx.btParams(v))
-            }, userAnnotation)
-            res.symbol.addAnnotation(AnnotationInfo(typeOf[BT], List(localTyper.typed(q"${constraints.toString}")), Nil))
+            val constraints = // `ct` annotation or constraints from all outer classes)
+              if (functionAnnotation(tree.symbol) =:= ct) BTConst(ct)
+              else ctx.outer.tail.foldLeft[BT](ctx.btParams(ctx.outer.head)) { (agg, v) =>
+                Join(agg, ctx.btParams(v))
+              }
 
+            res.symbol.addAnnotation(btAnnot(constraints))
+            if (name.toString == "pow") println(res)
             res
 
           case Block(stats, expr)                => treeCopy.Block(tree, stats.map(transform), transform(expr))
@@ -164,14 +207,14 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
       def variantType(tree: Tree): Type = tree match {
         case t: Tree if t.attachments.contains[TypeVariant]  => t.attachments.get[TypeVariant].get.tpe
         case Ident(_) if promotedTypes.contains(tree.symbol) => variantType(promotedTypes(tree.symbol)._1)
-        case Ident(_)                                        => promoteType(tree.tpe, dynamic)
+        case Ident(_)                                        => promoteType(tree.tpe, rt)
         case _ =>
           debug(s"<warn> Have no variant for: $tree: ${tree.tpe}")
           tree.tpe
       }
 
       def value[T](t: Tree): T = {
-        if (variant(t) =:= dynamic) throw new RuntimeException(s"Trying to fetch a value of the dynamic value: ${t}.")
+        if (variant(t) =:= rt) throw new RuntimeException(s"Trying to fetch a value of the dynamic value: ${t}.")
         (t match {
           case t if t.attachments.contains[TreeValue] => t.attachments.get[TreeValue].get
           case Literal(Constant(x))                   => x
@@ -349,7 +392,7 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
           (expectedTp, tp) match {
             case (Variant(TypeRef(_, ptp, pargs), variantE), Variant(TypeRef(_, _, args), variantA)) =>
               val constraints = (if (tparams.contains(ptp))
-                Seq((ptp -> Set(Constraint(variant(tp), if (variantE != dynamic) 1 else 0))))
+                Seq((ptp -> Set(Constraint(variant(tp), if (variantE != rt) 1 else 0))))
               else Seq()).toMap
               (pargs zip args).foldLeft(constraints)((agg, tps) => compose(agg, (params _).tupled(tps)))
           }
@@ -372,7 +415,7 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
               if (minimizedConstraints.contains(ptp)) minimizedConstraints(ptp)
               else variantE
 
-            if (expectedVariant <:< static && variantA =:= dynamic)
+            if (expectedVariant <:< static && variantA =:= rt)
               warning(s"Argument $arg did not match inlinity expected: $expectedTp got: $tp.")
 
             (pargs zip args).foreach(tps => typecheck(arg, tps._1, tps._2))
@@ -385,7 +428,7 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
               else variantE
 
             val newArgs = (pargs zip args).map(tps => (coaerce _).tupled(tps))
-            if (!(variantA =:= dynamic) && expectedVariant <:< variantA)
+            if (!(variantA =:= rt) && expectedVariant <:< variantA)
               promoteOne(TypeRef(prefix, tpe, newArgs), expectedVariant)
             else promoteOne(TypeRef(prefix, tpe, newArgs), variantA)
         }
@@ -463,7 +506,7 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
                   res
                 }
                 // if the argument is a function with types that are dynamic
-                if (global.definitions.isFunctionType(argTree.tpe) && argTree.tpe.typeArgs.forall(variant(_) == dynamic)) {
+                if (global.definitions.isFunctionType(argTree.tpe) && argTree.tpe.typeArgs.forall(variant(_) == rt)) {
                   // make a callback from the interpreter
                   val callback: List[Tree] => Tree = args => {
                     transform(localTyper.typed(inlineLambda(context)(arg, args)))
@@ -501,7 +544,7 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
             res.updateAttachment(TypeVariant(promoteType(returnType, ct)))
           } else if (!sym.isConstructor) {
             val res = treeCopy.Apply(tree, lhs, promoteArgs)
-            res.updateAttachment(TypeVariant(promoteType(tree.tpe, dynamic)))
+            res.updateAttachment(TypeVariant(promoteType(tree.tpe, rt)))
           } else {
             super.transform(tree)
           }
