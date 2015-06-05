@@ -18,28 +18,49 @@ trait PluginCommon {
   val variants = Set(ct, static, rt)
 
   object BT extends StaticAnnotation {
-    def apply(bt: String): BT = {
-      val terms = bt.split("").map(parseTerm)
-      terms.tail.foldLeft[BT](terms.head)((agg, v) => Meet(agg, v))
+
+    def meetOrJoin(bt: String): (BT, String) = {
+      val (lhs, rest) = apply0(bt)
+      if (rest.startsWith(" ^ ")) {
+        val (rhs, ret) = apply0(rest.substring(3, rest.length))
+        (Meet(lhs, rhs), ret)
+      } else if (rest.startsWith(" v ")) {
+        val (rhs, ret) = apply0(rest.substring(3, rest.length))
+        (Join(lhs, rhs), ret)
+      } else throw new RuntimeException("Parsing error!" + bt)
     }
 
-    private final def parseTerm(t: String) = t match {
-      case "ct" => BTConst(ct)
-      case "rt" => BTConst(rt)
-      case x    => BTVar(x)
+    def apply(bt: String): BT = apply0(bt)._1
+
+    def apply0(bt: String): (BT, String) = {
+      if (bt.startsWith("(")) {
+        val (res, rest) = meetOrJoin(bt.substring(1))
+        if (rest.head != ')') throw new RuntimeException("Parsing error!")
+        (res, rest.substring(1))
+
+      } else if (bt.startsWith("`rt")) (BTConst(rt), bt.substring("`rt".length))
+      else if (bt.startsWith("`ct")) (BTConst(ct), bt.substring("`ct".length))
+      else {
+        val (i, j) = (bt.indexOf(' '), bt.indexOf(')'))
+        if (i < 0 && j < 0) (BTVar(bt), "")
+        else {
+          val cutAt = if ((i * j) > 0) math.min(i, j) else math.max(i, j)
+          (BTVar(bt.substring(0, cutAt)), bt.substring(cutAt))
+        }
+      }
     }
   }
 
   trait BT {
     def simplify: BT
-    def substitute(vars: Map[String, Type]): BT
-    def solve(vars: Map[String, Type] = Map.empty): BT = substitute(vars).simplify
+    def substitute(vars: Map[String, BT]): BT
+    def solve(vars: Map[String, BT] = Map.empty): BT = substitute(vars).simplify
   }
   final case class BTVar(name: String) extends BT {
     override def toString: String = name
     def simplify: BT = throw new RuntimeException(s"Variable $this is not substituted!")
-    def substitute(vars: Map[String, Type]): BT =
-      vars.get(name).map(BTConst).getOrElse(this)
+    def substitute(vars: Map[String, BT]): BT =
+      vars.getOrElse(name, this)
   }
   final case class BTConst(bt: Type) extends BT {
     override def toString: String = bt match {
@@ -47,26 +68,39 @@ trait PluginCommon {
       case `rt` => "`rt"
     }
     def simplify: BT = this
-    def substitute(vars: Map[String, Type]): BT = this
+    def substitute(vars: Map[String, BT]): BT = this
   }
   final case class Meet(bt1: BT, bt2: BT) extends BT {
-    override def toString: String = s"$bt1 & $bt2"
+    override def toString: String = s"($bt1 ^ $bt2)"
 
-    def substitute(vars: Map[String, Type]): BT =
-      Meet(bt1.substitute(vars), bt2.substitute(vars))
+    def substitute(vars: Map[String, BT]): BT =
+      Meet(bt1.substitute(vars), bt2.substitute(vars)).simplify
 
     override def simplify: BT = this match {
-      case Meet(BTConst(c1), BTConst(c2)) => BTConst(lub(c1 :: c2 :: Nil))
+      case Meet(BTConst(c1), BTConst(c2))        => BTConst(glb(c1 :: c2 :: Nil))
+      case Meet(lhs, `top`)                      => lhs.simplify
+      case Meet(`top`, rhs)                      => rhs.simplify
+      case Meet(lhs, `bot`)                      => BTConst(bot)
+      case Meet(`bot`, rhs)                      => BTConst(bot)
+      case Meet(lhs, rhs) if lhs == rhs          => lhs // idempotency
+      case a Meet (b Join c) if a == b || a == c => a // absorption
     }
   }
   final case class Join(bt1: BT, bt2: BT) extends BT {
-    override def toString: String = s"$bt1 | $bt2"
-    def substitute(vars: Map[String, Type]): BT =
+    override def toString: String = s"($bt1 v $bt2)"
+    def substitute(vars: Map[String, BT]): BT =
       Join(bt1.substitute(vars), bt2.substitute(vars))
 
     override def simplify: BT = this match {
-      case Join(BTConst(c1), BTConst(c2)) => BTConst(glb(c1 :: c2 :: Nil))
+      case Join(BTConst(c1), BTConst(c2))        => BTConst(lub(c1 :: c2 :: Nil))
+      case Join(lhs, `top`)                      => BTConst(top)
+      case Join(`top`, rhs)                      => BTConst(top)
+      case Join(lhs, `bot`)                      => lhs.simplify
+      case Join(`bot`, rhs)                      => rhs.simplify
+      case Join(lhs, rhs) if lhs == rhs          => lhs // idempotency
+      case a Join (b Meet c) if a == b || a == c => a.simplify // absorption
     }
+
   }
 
   object Variant {
@@ -97,6 +131,7 @@ trait PluginCommon {
     if (allBT.size > 1) error("Function should have one BT annotation.")
     allBT.headOption.map(_.tree).map { case Literal(Constant(c: String)) => BT(c) }.get
   }
+
   def userAugmented(constraints: BT, annTpe: Type) = annTpe match {
     case `ct` => Join(constraints, BTConst(ct))
     case `rt` => Meet(constraints, BTConst(rt))

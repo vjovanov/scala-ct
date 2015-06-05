@@ -72,7 +72,6 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
           case AnnotatedType(l, TypeRef(prefix, tp, args)) if l.exists(ann => variants.exists(_ =:= ann.atp)) =>
             val annList = l.filter(ann => variants.exists(_ =:= ann.atp))
             val annTpe = annList.head.atp
-
             val userConstraints = userAugmented(constraints, annTpe)
 
             AnnotatedType(btAnnot(userConstraints) :: l, TypeRef(prefix, tp, args.map(annotate)))
@@ -93,7 +92,12 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
         case _            => ???
       }
 
-      def annotate(s: Symbol, constraints: BT): Symbol = ???
+      def annotateTerm(t: Tree, constraints: BT): Tree = {
+        t.attachments.update[BT](constraints)
+        t
+      }
+
+      def constraints(t: Tree): BT = t.attachments.get[BT].get
 
       override def transform(tree: Tree): Tree = withIdent(1) {
         val res = tree match {
@@ -137,7 +141,6 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
             // TODO expected type
             val newParamss = vparamss.map(_.map(p => treeCopy.ValDef(p, p.mods, p.name, annotate(p.tpt), p.rhs)))
             val res = treeCopy.DefDef(tree, mods, name, tparams, newParamss, annotate(tpt), withCtx(newCtx)(transform(rhs)))
-            // TODO introduce annotations to result types
 
             // add bt variables to function
             if (newVars.nonEmpty) {
@@ -155,13 +158,21 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
             if (name.toString == "pow") println(res)
             res
 
-          case Block(stats, expr)                => treeCopy.Block(tree, stats.map(transform), transform(expr))
-          case Apply(fun, args)                  => treeCopy.Apply(tree, transform(fun), args.map(transform))
-          case Super(qual, mix)                  => treeCopy.Super(tree, transform(qual), mix)
-          case This(qual)                        => treeCopy.This(tree, qual)
-          case Literal(Constant(a))              => tree
-          case ValDef(mods, name, tpt, rhs)      => treeCopy.ValDef(tree, mods, name, tpt, rhs)
-          case If(cond, thenp, elsep)            => treeCopy.If(tree, transform(cond), transform(thenp), transform(elsep))
+          case Block(stats, expr) => // TODO strip class related variables and reintroduce them
+            val tExpr = transform(expr) // get annotation and attach a new one
+            //            annotateTerm(treeCopy.Block(tree, stats.map(transform), tExpr), constraints(tExpr))
+            treeCopy.Block(tree, stats.map(transform), tExpr)
+          case Apply(fun, args)             => treeCopy.Apply(tree, transform(fun), args.map(transform))
+          case Super(qual, mix)             => treeCopy.Super(tree, transform(qual), mix)
+          case This(qual)                   => treeCopy.This(tree, qual)
+          case Literal(Constant(a))         => tree
+          case ValDef(mods, name, tpt, rhs) => treeCopy.ValDef(tree, mods, name, tpt, rhs)
+
+          case If(cond, thenp, elsep) =>
+            // deeply nested transformation based on the boolean
+            treeCopy.If(tree, transform(cond), transform(thenp), transform(elsep))
+          // new constraints
+
           case Throw(expr)                       => treeCopy.Throw(tree, expr)
           case TypeDef(mods, name, tparams, rhs) => treeCopy.TypeDef(tree, mods, name, tparams, transform(rhs))
           case New(tpt)                          => treeCopy.New(tree, tpt)
