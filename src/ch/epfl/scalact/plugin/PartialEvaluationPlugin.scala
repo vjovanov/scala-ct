@@ -1,6 +1,7 @@
 package ch.epfl.scalact.plugin
 
-import ch.epfl.scalact
+import java.io.{ PrintWriter, StringWriter }
+
 import ch.epfl.scalact._
 
 import scala.reflect.macros.blackbox.Context
@@ -11,6 +12,7 @@ import nsc.plugins.Plugin
 import nsc.plugins.PluginComponent
 import scala.collection.mutable
 import scala.reflect.interpreter._
+import scala.util.control.NonFatal
 
 class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginCommon {
   import global._
@@ -25,6 +27,8 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
     BTVar("c" + varCnt)
   }
 
+  val transformedDefs: mutable.Map[Symbol, Tree] = mutable.Map.empty
+
   /**
    * Performs binding time analysis and coercion.
    */
@@ -36,10 +40,13 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
 
     case class BTContext(
       constructor: Boolean = false,
-      tparams: Set[Symbol] = Set.empty,
-      selfBT: Type = rt,
+      tparams: Map[Symbol, BTVar] = Map.empty,
       btParams: Map[Symbol, BTVar] = Map.empty,
-      outer: List[Symbol] = Nil) {
+      btContext: BTParams = BTParams(Set(), Set()),
+      selfBT: Type = rt,
+      outer: List[Symbol] = Nil,
+      expTp: Type = typeOf[Unit],
+      args: List[List[Tree]] = Nil) {
       def addParam(sym: Symbol, p: BTVar) =
         copy(btParams = btParams + ((sym, p)))
 
@@ -56,25 +63,82 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
 
     class BTTyperTransformer(unit: CompilationUnit) extends TypingTransformer(unit) {
 
-      def btAnnot(constraints: BT): AnnotationInfo = AnnotationInfo(typeOf[ch.epfl.scalact.BT], List(localTyper.typed(q"${constraints.toString}")), Nil)
+      def classParams(tpSym: Symbol, tpMap: Map[Symbol, BTVar] = Map()): (BTParams, Map[Symbol, BTVar], BTVar) = tpSym.getAnnotation(typeOf[BTParams].typeSymbol) match {
+        case _ => // TODO we assume constructors are always empty
+          val btVar = BTVar("bt")
+          val initVars = Set(btVar) // TODO name is bt for now (should be a full type)
+          val initConstraints = Set[<::]()
+          val (tpVars, tpConstraints, newTpMap) = tpSym.typeParams.foldLeft((initVars, initConstraints, tpMap)) { (agg, tparam) =>
+            val newVar = BTVar(tparam.name.toString())
+            (agg._1 + newVar, agg._2 + <::(newVar, btVar), agg._3 + (tparam -> newVar))
+          }
+          // TODO influence on the constraints by the constructor? Could it be the case that T<:U or T <: i (where i is some other parameter)?
+          (BTParams(tpVars, tpConstraints), newTpMap, btVar)
+      }
 
-      def annotate(tpe: Type): Type = {
-        val constraints: BT = ctx.outer.tail.foldLeft[BT](ctx.btParams(ctx.outer.head)) { (agg, v) =>
-          Meet(agg, ctx.btParams(v))
+      object AnnTypeRef {
+        def unapply(x: Any): Option[(List[AnnotationInfo], Type, Symbol, List[Type])] = x match {
+          case TypeRef(p, s, args)                   => Some(((Nil: List[AnnotationInfo]), p, s, args))
+          case AnnotatedType(l, TypeRef(p, s, args)) => Some((l, p, s, args))
+          case _                                     => None
         }
+      }
+
+      def tpeParams(tp: Type, prefix: String = "", tpMap: Map[Symbol, BTVar] = Map.empty): (Type, BTParams) = {
+        def btParams0(tp: Type, depth: Int, index: Int, prefix: String = ""): (Type, BTParams, BTVar) =
+          tp match {
+            // TODO variance add -/+/_
+            case AnnTypeRef(annots, p, tpSym, targs) =>
+              val types = targs.zipWithIndex.foldLeft(Nil: List[(Type, BTParams, BTVar)])((agg, tpeI) => btParams0(tpeI._1, depth + 1, tpeI._2) +: agg).reverse
+              // combine BT params and add constraints
+              val combined = types.map(_._2).foldLeft(BTParams(Set(), Set())) { (agg, btparams) =>
+                BTParams(agg.vars ++ btparams.vars, agg.constraints ++ btparams.constraints)
+              }
+              val newVar = if (tpSym.isTypeParameter) tpMap(tpSym) else BTVar(prefix + s"${depth}_$index")
+              val newConstraints = types.map(x => <::(x._3, newVar)).toSet
+              val annotatedConstraints = newConstraints ++
+                annots.find(_.atp =:= ct).map(_ => Set(<::(newVar, BTConst(ct)))).getOrElse(Set())
+              val withWff = combined.copy(vars = combined.vars + newVar, constraints = combined.constraints ++ annotatedConstraints)
+              (AnnotatedType(annots :+ AnnotationInfo(typeOf[BT], List(localTyper.typed(q"${newVar.toString}")), Nil), TypeRef(p, tpSym, types.map(_._1))), withWff, newVar)
+          }
+        val (resTp, resParams, _) = btParams0(tp, 0, 0, prefix)
+        (resTp, resParams)
+      }
+
+      // TODO remove later
+      def validate() = {
+        println("Type defs:")
+        println(classParams(typeOf[Int].typeSymbol))
+        println(classParams(typeOf[List[_]].typeSymbol))
+        println("Types:")
+        println(tpeParams(typeOf[Int]))
+        println(tpeParams(typeOf[List[Int]]))
+        println(tpeParams(typeOf[List[(List[Int], String, Int => Int)]]))
+        println(tpeParams(typeOf[List[Int @ct] @ct]))
+        println(tpeParams(typeOf[List[Int] @ct]))
+
+        // TODO println for the method symbol
+      }
+      val x = validate()
+
+      def btAnnot(constraints: BT): AnnotationInfo =
+        AnnotationInfo(typeOf[BT], List(localTyper.typed(q"${constraints.toString}")), Nil)
+
+      def annotate(tpe: Type, constraints: BT = ctx.outer.tail.foldLeft[BT]((ctx.btParams ++ ctx.tparams)(ctx.outer.head)) { (agg, v) =>
+        Meet(agg, (ctx.btParams ++ ctx.tparams)(v))
+      }): Type = {
         tpe.widen.dealias match {
           case TypeRef(prefix, tp, args) if tp.isTypeParameter =>
-            AnnotatedType(List(btAnnot(ctx.btParams(tp))), TypeRef(prefix, tp, args.map(annotate)))
+            TypeRef(prefix, tp, args.map(annotate(_, constraints)))
 
           case TypeRef(prefix, tp, args) =>
-            AnnotatedType(List(btAnnot(constraints)), TypeRef(prefix, tp, args.map(annotate)))
+            AnnotatedType(List(btAnnot(constraints)), TypeRef(prefix, tp, args.map(annotate(_, constraints))))
 
           case AnnotatedType(l, TypeRef(prefix, tp, args)) if l.exists(ann => variants.exists(_ =:= ann.atp)) =>
             val annList = l.filter(ann => variants.exists(_ =:= ann.atp))
             val annTpe = annList.head.atp
-            val userConstraints = userAugmented(constraints, annTpe)
-
-            AnnotatedType(btAnnot(userConstraints) :: l, TypeRef(prefix, tp, args.map(annotate)))
+            ???
+          //            AnnotatedType(btAnnot(constraints, BT(annTpe)) :: l, TypeRef(prefix, tp, args.map(annotate(_, constraints))))
 
           case MethodType(l, resTp) => ???
 
@@ -92,86 +156,196 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
         case _            => ???
       }
 
-      def annotateTerm(t: Tree, constraints: BT): Tree = {
-        t.attachments.update[BT](constraints)
+      def annotateTerm(t: Tree, tpe: Type): Tree = {
+        t.updateAttachment(tpe)
         t
       }
 
-      def constraints(t: Tree): BT = t.attachments.get[BT].get
+      def annotation(t: Tree): Type = // TODO drop the try
+        try t.attachments.get[Type].get
+        catch { case NonFatal(e) => /*println(s"No annotation on tree: $t");*/ t.tpe }
+
+      def promote(tp: Type, bt: BT): Type = tp.dealias.widen match {
+        case TypeRef(prefix, tp, Nil) =>
+          AnnotatedType(List(btAnnot(bt)), TypeRef(prefix, tp, Nil))
+      }
+
+      def coaerce(tp: Type): Type = { // TODO variance
+        println("Coaercing: " + tp + " to " + ctx.expTp)
+        if (ctx.expTp =:= typeOf[Unit]) tp // nothing to coaerce
+        else {
+          def coaerce0(tp: Type, expTp: Type): (Type, BTParams) = (tp, expTp) match {
+            case (AnnTypeRef(annots, p, tpSym, targs), AnnTypeRef(eannots, ep, etpSym, etargs)) =>
+              if (targs.length != etargs.length) throw new Exception("We currently do not support nominal subtyping.")
+              else {
+                val (types, btParams) = (targs zip etargs).map((coaerce0 _).tupled).unzip
+
+                val newConstraints = btParams.foldLeft(BTParams(Set(), Set()))(_ ++ _)
+                // get annot bt and extract the VarName/Parse
+                def getBT(annots: List[AnnotationInfo]): BT =
+                  annots.find(_.atp =:= typeOf[BT]).map(x => x.args.head).map { case Literal(Constant(c: String)) => BT(c) }.get
+                val (bt: BTVar, ebt: BTVar) = (getBT(annots), getBT(eannots))
+                val newConstraint = <::(ebt, bt)
+                // TODO fail with exceptions
+                (AnnotatedType(annots, TypeRef(p, tpSym, types)), newConstraints.copy(constraints = newConstraints.constraints + newConstraint))
+              }
+          }
+
+          val (rettp, constraints) = coaerce0(tp, ctx.expTp)
+          ctx = ctx.copy(btContext = ctx.btContext ++ constraints)
+          rettp
+        }
+      }
 
       override def transform(tree: Tree): Tree = withIdent(1) {
         val res = tree match {
-          case pd @ PackageDef(refTree, body) => treeCopy.PackageDef(tree, refTree, body.map(transform))
-          case Import(_, _)                   => tree
+          case pd @ PackageDef(refTree, body) =>
+            treeCopy.PackageDef(tree, refTree, body.map(transform))
+          case Import(_, _) => tree
 
           case ClassDef(mods, name, tparams, tmpl) =>
-            val tmpCtx = ctx.copy(
-              tparams = ctx.tparams ++ tparams.map(_.symbol),
-              outer = tree.tpe.typeSymbol :: ctx.outer)
-            val newVars =
-              tparams.map(_.symbol).foldLeft(Map.empty[Symbol, BTVar])((agg, v) => agg + ((v, freshVar()))) +
-                ((tree.tpe.typeSymbol, freshVar()))
-            val newCtx = newVars.foldLeft(tmpCtx)((ctx, v) => ctx addParam (v._1, v._2))
+            if (false) tree // TODO remove
+            else {
+              val tmpCtx = ctx.copy(outer = tree.symbol :: ctx.outer)
+              val (btContext, tParams, newVar) = classParams(tree.symbol)
+              val newCtx = tmpCtx.copy(tparams = tmpCtx.tparams ++ tParams, btContext = tmpCtx.btContext ++ btContext)
 
-            val res = treeCopy.ClassDef(tree, mods, name, tparams, withCtx(newCtx) { transformTemplate(tmpl) })
-
-            val annotArgs = newVars.map(v => localTyper.typed(q"${v._2.toString}"))
-            res.symbol.addAnnotation(AnnotationInfo(typeOf[BTParams], annotArgs.toList, Nil))
-            res
+              val res = treeCopy.ClassDef(tree, mods, name, tparams, withCtx(newCtx.addParam(tree.symbol, newVar)) {
+                transformTemplate(tmpl)
+              })
+              // TODO convert btParams to a tree
+              res.symbol.addAnnotation(AnnotationInfo(typeOf[BTParams], localTyper.typed(q"${btContext.toString}") :: Nil, Nil))
+              res
+            }
 
           case ModuleDef(mods, name, tmpl) =>
-            val newCtx = ctx.copy(outer = tree.symbol :: ctx.outer)
-              .addParam(tree.symbol, freshVar())
-
+            val newCtx = ctx.copy(outer = tree.symbol :: ctx.outer).addParam(tree.symbol, freshVar())
             treeCopy.ModuleDef(tree, mods, name, withCtx(newCtx)(transformTemplate(tmpl)))
 
           case Template(parents, self, body) => treeCopy.Template(tree, parents.map(transform), transformValDef(self), body.map(transform))
-          case Select(qual, name)            => treeCopy.Select(tree, transform(qual), name)
           case Ident(i)                      => treeCopy.Ident(tree, i)
           case TypeTree()                    => treeCopy.TypeTree(tree)
 
           case DefDef(mods, name, tparams, vparamss, tpt, rhs) =>
-            val tmpCtx = ctx.copy(tparams = ctx.tparams ++ tparams.map(_.symbol))
-            val newVars =
-              tparams.map(_.symbol).foldLeft(Map.empty[Symbol, BTVar])((agg, v) => agg + ((v, freshVar())))
-            val newCtx = newVars.foldLeft(tmpCtx)((ctx, v) => ctx addParam (v._1, v._2))
+            if (!(tree.symbol.owner.isClass || tree.symbol.owner.isModule) || tree.symbol.asMethod.isConstructor) tree
+            else { // TODO for now only top-level methods
+              println(s"Processing $tree:")
+              // introduce the method variable
+              val methodVar = BTVar("m_" + name.toString)
+              // introduce type params to the context
+              val (tParamsContext, newTparams) = tparams.foldLeft((BTParams(Set(methodVar), Set()), ctx.tparams)) { (agg, tparam) =>
+                val newVar = BTVar("m_" + tparam.name.toString())
+                (BTParams(agg._1.vars + newVar, agg._1.constraints + (<::(newVar, methodVar))), agg._2 + (tparam.symbol -> newVar))
+              }
+              val paramCtx = ctx.copy(btContext = ctx.btContext ++ tParamsContext, tparams = ctx.tparams ++ newTparams)
 
-            // TODO verify the subtyping relations
-            // TODO return type based on blocks
-            // TODO expected type
-            val newParamss = vparamss.map(_.map(p => treeCopy.ValDef(p, p.mods, p.name, annotate(p.tpt), p.rhs)))
-            val res = treeCopy.DefDef(tree, mods, name, tparams, newParamss, annotate(tpt), withCtx(newCtx)(transform(rhs)))
+              // process parameters
+              val variables = vparamss.map(_.map(v => tpeParams(v.tpt.tpe, tpMap = paramCtx.tparams)))
+              val paramsVariables = (vparamss zip variables).map { case (a, b) => a zip b }
+              val newParamss = paramsVariables.map(_.map { case (p, (tpe, _)) => treeCopy.ValDef(p, p.mods, p.name, TypeTree(tpe), p.rhs) })
+              val variablesContext = paramsVariables.flatten.map(_._2._2).foldLeft(ctx.btContext)((agg, v) => agg ++ v)
 
-            // add bt variables to function
-            if (newVars.nonEmpty) {
-              val annotArgs = newVars.map(v => localTyper.typed(q"${v._2.toString}"))
-              res.symbol.addAnnotation(AnnotationInfo(typeOf[BTParams], annotArgs.toList, Nil))
+              // process return type
+              val (rTpe, btParams) = tpeParams(tpt.tpe, prefix = "r_", tpMap = ctx.tparams)
+              val resultContext = variablesContext ++ btParams
+
+              // process body
+              var updatedCtx: BTParams = null
+              val newRhs = withCtx(paramCtx.copy(expTp = rTpe, btContext = resultContext)) {
+                val res = transform(rhs)
+                updatedCtx = ctx.btContext
+                res
+              }
+              val res = treeCopy.DefDef(tree, mods, name, tparams, newParamss, TypeTree(rTpe), newRhs)
+              transformedDefs += (res.symbol -> res)
+              // add bt variables to function definition
+              res.symbol.addAnnotation(AnnotationInfo(typeOf[BTParams], List(localTyper.typed(q"${updatedCtx.toString}")), Nil))
+
+              res
+            }
+          case Block(stats, expr) =>
+            val expTp = ctx.expTp
+            val nstats = withCtx(ctx.copy(expTp = typeOf[Unit])) { stats.map(transform) }
+            val nexpr = transform(expr)
+            val res = treeCopy.Block(tree, nstats, nexpr)
+            res
+          case Select(qual, name) =>
+            val tQual = transform(qual)
+            // get the symbol
+            // fetch the args
+            /*if (tree.symbol.isMethod) { // we do not care about packages
+              val methodSym = tree.symbol.asMethod
+              val annots = methodSym.annotations
+              val (methodBT, btParams) = (
+                annots.find(_.tree.tpe =:= typeOf[ch.epfl.scalact.BT]),
+                annots.find(_.tree.tpe =:= typeOf[ch.epfl.scalact.BTParams]))
+
+              val expected = if (methodBT.nonEmpty) {
+                val (tparams, paramss, retTp) = transformedDefs(methodSym) match {
+                  case q"${ _ } def ${ _ }[..$tparams](...$paramss): $tpe = ${ _ }" =>
+                    (tparams, paramss.map(_.map { case q"${ _ } val ${ _ }: $tpTree = ${ _ }" => tpTree.tpe }), tpe)
+                }
+
+                def params(expectedTp: Type, tp: Type): Set[Subst] = {
+                  (expectedTp, tp) match {
+                    case (bt1 @ BT(PolyType(sym, eargs)), bt2 @ BT(PolyType(_, args))) =>
+                      val constraints = if (eargs.length == args.length)
+                        (eargs zip args).foldLeft(Set[Subst]())((agg, tps) => agg + params(tps._1, tps._2))
+                      else Set[Subst]()
+
+                      constraints + Subst(bt1.asInstanceOf[BTVar], bt2)
+
+                  }
+                }
+
+                case class Subst(v: BTVar, bt: BT)
+                val constraints = (ctx.args.flatten zip paramss.flatten).foldLeft(Set[Subst]()) { (agg, tps) =>
+                  val (tp, expTp) = tps
+
+                  agg
+                }
+                println(constraints)
+              } else None // TODO invent them at the spot
+
+            } */
+            // collect constraints for binding times and then for each type apply those constraints.
+            // for user types simply reject if it is impossible.
+            // for the user binding time
+            // T -> BT
+            // c1-> BT
+
+            // output
+            // mapping from bt variables to concrete binding times
+            // user type
+            // should be computed based on the user type of the lhs
+            // ct type should be computed based on the
+            //   ct of the method if the method is present
+            //   approximated if the method is not present
+            // if yes, apply substitute them with current ct
+            // if no, external code use yours directly
+            treeCopy.Select(tree, tQual, name)
+
+          case Apply(fun, args) =>
+            val (newFun, newArgs) = withCtx(ctx.copy(expTp = typeOf[Unit])) {
+              (transform(fun), args.map(transform))
             }
 
-            val constraints = // `ct` annotation or constraints from all outer classes)
-              if (functionAnnotation(tree.symbol) =:= ct) BTConst(ct)
-              else ctx.outer.tail.foldLeft[BT](ctx.btParams(ctx.outer.head)) { (agg, v) =>
-                Join(agg, ctx.btParams(v))
-              }
+            treeCopy.Apply(tree, newFun, newArgs)
+          // TODO set the final type
 
-            res.symbol.addAnnotation(btAnnot(constraints))
-            if (name.toString == "pow") println(res)
-            res
+          case Super(qual, mix) => treeCopy.Super(tree, transform(qual), mix)
+          case This(qual)       => treeCopy.This(tree, qual)
+          case Literal(Constant(a)) =>
+            val tpe = promote(tree.tpe, BTVar("bt")) // TODO add a more general scheme
+            val newTpe = coaerce(tpe)
 
-          case Block(stats, expr) => // TODO strip class related variables and reintroduce them
-            val tExpr = transform(expr) // get annotation and attach a new one
-            //            annotateTerm(treeCopy.Block(tree, stats.map(transform), tExpr), constraints(tExpr))
-            treeCopy.Block(tree, stats.map(transform), tExpr)
-          case Apply(fun, args)             => treeCopy.Apply(tree, transform(fun), args.map(transform))
-          case Super(qual, mix)             => treeCopy.Super(tree, transform(qual), mix)
-          case This(qual)                   => treeCopy.This(tree, qual)
-          case Literal(Constant(a))         => tree
-          case ValDef(mods, name, tpt, rhs) => treeCopy.ValDef(tree, mods, name, tpt, rhs)
+            tree
+          case q"ct(${ c: Literal })" => Literal(Constant(c))
+          case ValDef(mods, name, tpt, rhs) =>
+            treeCopy.ValDef(tree, mods, name, tpt, rhs)
 
           case If(cond, thenp, elsep) =>
-            // deeply nested transformation based on the boolean
-            treeCopy.If(tree, transform(cond), transform(thenp), transform(elsep))
-          // new constraints
+            treeCopy.If(tree, cond, thenp, elsep)
 
           case Throw(expr)                       => treeCopy.Throw(tree, expr)
           case TypeDef(mods, name, tparams, rhs) => treeCopy.TypeDef(tree, mods, name, tparams, transform(rhs))
@@ -185,6 +359,9 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
         res
       }
     }
+
+    //    def infer()
+
   }
 
   private object Component extends PluginComponent with TypingTransformers with Transform {
@@ -322,33 +499,10 @@ class PartialEvaluationPlugin(val global: Global) extends Plugin with PluginComm
         finalRes
       }
 
-      /*
-       * Fetching sources.
-       */
-      def symSourceWithModuleClasses = global.currentRun.symSource.map(x => (if (x._1.isModule) x._1.moduleClass else x._1, x._2))
-
       def canInline(sym: Symbol): Boolean =
         sym.ownerChain.find(symSourceWithModuleClasses.contains(_)).nonEmpty ||
           sym.ownerChain.find(global.currentRun.symSource.contains(_)).nonEmpty ||
           sym.owner == typeOf[Function1[_, _]].typeSymbol || sym.owner == typeOf[Function2[_, _, _]].typeSymbol
-
-      def fetchBody(sym: Symbol): Option[Tree] = {
-        val classSym = sym.ownerChain.find(symSourceWithModuleClasses.contains(_)).orElse(
-          sym.ownerChain.find(global.currentRun.symSource.contains(_)))
-        classSym.flatMap { classSym =>
-          val file = (if (global.currentRun.symSource.contains(classSym))
-            global.currentRun.symSource
-          else symSourceWithModuleClasses)(classSym)
-
-          val unit = global.currentRun.units.find(_.source.file == file).get
-          val method = unit.body.find {
-            case df: DefDef => df.symbol == sym
-            case _          => false
-          }
-
-          method
-        }
-      }
 
       def minimize(block: Tree): Tree = {
         debug("Minimizing:" + block, Minimization)

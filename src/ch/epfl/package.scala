@@ -2,6 +2,39 @@ package ch.epfl
 
 import scala.annotation.StaticAnnotation
 
+/*
+ *  BT Parameters and type checking:
+ *  class Vector<cVector, cT, cT <: cVector>[T](val store: Array<cVector, cT>[T])
+ *    extends Iterable<cVector, cT>[T] {
+ *
+ *    (def length: Int|<CVector>|)<cVector> = store.length
+ *
+ *    (def hashCode: Int|<CVector v cT>|)<cVector> = {
+ *      // TODO should we infer here or put a bottom or put a top???
+ *      (<cx, cVector <: cx> def hash(x: Any<chash>): Int|<cx>| = x.hashCode)<cVector>
+ *      store.foldLeft<cVector, cVector v ct>(0<cVector>)(hash)<cVector>)
+ *
+ *    (def map<cMap, cU, cU <: cMap>[U](f: (T<cT> => U<cU>)<cMap>): Vector<cVector, cU>[U])<cVector> = {
+ *      val newArray = new Array<cVector v cMap, cU>[U](store.size)
+ *      var i: Int|<cVector v cMap>| = 0<cVector v cMap>
+ *      val x: Any|<cT>| = store.head // TODO insert this example somewhere!!!
+ *      store.foreach<cVector v cMap>({ (x: T<cT>) =>
+ *        newArray(i) = f(store(i))
+ *        i += 1<cVector v cMap>
+ *      }<cVector v cMap>)
+ *      new Vector<cVector v cMap, cU>[U](newArray)
+ *    }
+ *
+ *    def foo<cFoo>(x: T, f: <cf, cf1, cf2, cf <: cFoo>(Any => Int)): Int|<cT, cT <: cf1 >| = f(x)
+ *
+ *  }
+ *
+ * BT inference:
+ *
+ *
+ *
+ */
+
 package object scalact {
 
   sealed trait Variant extends StaticAnnotation

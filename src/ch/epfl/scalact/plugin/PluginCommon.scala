@@ -1,5 +1,7 @@
 package ch.epfl.scalact.plugin
 
+import java.io.{ PrintWriter, StringWriter }
+
 import ch.epfl.scalact._
 
 import scala.annotation.StaticAnnotation
@@ -17,6 +19,60 @@ trait PluginCommon {
   val static = typeOf[ch.epfl.scalact.static]
   val variants = Set(ct, static, rt)
 
+  def showBT(t: Tree): String = {
+    val buffer = new StringWriter()
+    val writer = new PrintWriter(buffer)
+    val printer = new TreePrinter(writer) {
+      override def printTree(t: Tree) = {
+        super.printTree(t)
+        t match {
+          case t: Tree =>
+            t.attachments.get[Type].foreach(tp => print("{" + tp + "}"))
+          case _ =>
+        }
+      }
+    }
+    printer.print(t)
+    buffer.toString
+  }
+
+  /*
+  * Fetching sources.
+  */
+  def symSourceWithModuleClasses =
+    global.currentRun.symSource.map(x => (if (x._1.isModule) x._1.moduleClass else x._1, x._2))
+
+  def fetchBody(sym: Symbol): Option[Tree] = {
+    val classSym = sym.ownerChain.find(symSourceWithModuleClasses.contains(_)).orElse(
+      sym.ownerChain.find(global.currentRun.symSource.contains(_)))
+    classSym.flatMap { classSym =>
+      val file = (if (global.currentRun.symSource.contains(classSym))
+        global.currentRun.symSource
+      else symSourceWithModuleClasses)(classSym)
+
+      val unit = global.currentRun.units.find(_.source.file == file).get
+      val method = unit.body.find {
+        case df: DefDef => df.symbol == sym
+        case _          => false
+      }
+
+      method
+    }
+  }
+
+  case class <::(v: BTVar, bt: BT) {
+    override def toString(): String = v.toString + "<:" + bt.toString
+  }
+
+  case class BTParams(vars: Set[BTVar], constraints: Set[<::]) {
+    def this(s: String) = this(???, ???)
+
+    def ++(that: BTParams): BTParams = copy(vars = vars ++ that.vars, constraints = constraints ++ that.constraints)
+  }
+
+  /*
+   * Annotation that carries two binding times (user annotated, ct-inferred).
+   */
   object BT extends StaticAnnotation {
 
     def meetOrJoin(bt: String): (BT, String) = {
@@ -31,6 +87,7 @@ trait PluginCommon {
     }
 
     def apply(bt: String): BT = apply0(bt)._1
+    def apply(user: String, ct: String): (BT, BT) = (apply0(user)._1, apply0(ct)._1)
 
     def apply0(bt: String): (BT, String) = {
       if (bt.startsWith("(")) {
@@ -82,7 +139,7 @@ trait PluginCommon {
       case Meet(`top`, rhs)                      => rhs.simplify
       case Meet(lhs, `bot`)                      => BTConst(bot)
       case Meet(`bot`, rhs)                      => BTConst(bot)
-      case Meet(lhs, rhs) if lhs == rhs          => lhs // idempotency
+      case Meet(lhs, rhs) if lhs == rhs          => lhs // idempotent
       case a Meet (b Join c) if a == b || a == c => a // absorption
     }
   }
@@ -97,7 +154,7 @@ trait PluginCommon {
       case Join(`top`, rhs)                      => BTConst(top)
       case Join(lhs, `bot`)                      => lhs.simplify
       case Join(`bot`, rhs)                      => rhs.simplify
-      case Join(lhs, rhs) if lhs == rhs          => lhs // idempotency
+      case Join(lhs, rhs) if lhs == rhs          => lhs // idempotent
       case a Join (b Meet c) if a == b || a == c => a.simplify // absorption
     }
 
@@ -126,15 +183,15 @@ trait PluginCommon {
     allVariants.headOption.map(_.tree.tpe).getOrElse(rt)
   }
 
-  def btAnnotation(methodSym: Symbol): BT = {
+  /*def btAnnotation(methodSym: Symbol): BT = {
     val allBT = methodSym.annotations.filter(_.tree.tpe <:< typeOf[ch.epfl.scalact.BT])
     if (allBT.size > 1) error("Function should have one BT annotation.")
     allBT.headOption.map(_.tree).map { case Literal(Constant(c: String)) => BT(c) }.get
-  }
+  } */
 
-  def userAugmented(constraints: BT, annTpe: Type) = annTpe match {
-    case `ct` => Join(constraints, BTConst(ct))
-    case `rt` => Meet(constraints, BTConst(rt))
+  def BT(annTpe: Type) = annTpe match {
+    case `ct` => BTConst(ct)
+    case `rt` => BTConst(rt)
   }
 
   /*
